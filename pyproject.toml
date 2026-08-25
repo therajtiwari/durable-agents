@@ -19,6 +19,7 @@ dev = [
     "pytest-asyncio",
     "testcontainers[postgres]",
     "mypy",
+    "asyncpg-stubs",
 ]
 
 [tool.hatch.build.targets.wheel]
