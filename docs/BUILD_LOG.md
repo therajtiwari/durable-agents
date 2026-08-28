@@ -466,3 +466,247 @@ Postgres schema, `EventStore` (interface + Postgres implementation),
 files — `state.py` is now written (by exception, see above);
 `orchestrator.py` and `guardrails/decisions.py` are Week 2+ work and still
 genuinely untouched.
+
+---
+
+## Iteration 5 — Week 2 begins: LLM client + tool registry (Week 2, Day 1)
+
+Build order chosen deliberately to avoid the same forward-dependency
+mistake hit in Iteration 3 (a protocol needing a type that didn't exist
+yet): `llm/protocol.py` before anything that calls it, `tools/registry.py`
+before the tools that use its decorator.
+
+### llm/protocol.py — LLMClient as an ABC, LLMResponse reusing events.py's types
+
+Same ABC-over-Protocol choice as `EventStore`, made explicitly for
+consistency rather than assumed — asked again rather than silently
+reapplying the earlier decision, since it's a real fork each time a new
+interface gets added.
+
+`LLMResponse` mirrors `LLMCallCompleted`'s fields (content, tool_calls,
+stop_reason, tokens, cost, latency, provider_request_id) minus the
+event-log bookkeeping (`seq`/`created_at`/`step`) — those get added by the
+orchestrator when it turns a response into an event, not by the LLM layer
+itself. `tool_calls` reuses `ToolCallInvocation` from `events.py` directly
+rather than defining a parallel type, since the same shape needs to flow
+from "what the model said" straight into "what got logged" with zero
+conversion.
+
+One deliberately loose typing choice: `call()`'s `tools` parameter is
+`list[dict[str, Any]]` — raw JSON tool schemas, not the tool registry's
+own `Tool` type. This keeps the LLM layer decoupled from
+`tools/registry.py`'s internal representation; the LLM client only needs
+the already-serialized schema form.
+
+### llm/scripted.py — ScriptedLLM
+
+Direct implementation of spec section 16 Layer 0's pattern: a fixed list
+of `LLMResponse | Exception`, returned/raised in order, `call_count`
+tracked. Worth remembering: **this ships in the PyPI package**, unlike
+`refund_tools.py` — it's generic testing infrastructure any consumer of
+the runtime needs (the same role Django's `TestClient` plays), not
+demo-specific code. Verified manually: responses replay in order, a
+scripted exception raises correctly on its turn.
+
+### tools/registry.py — the @tool decorator
+
+Two real decisions, both flagged and answered before writing:
+
+1. **JSON schema for tool parameters is auto-derived from the function's
+   type hints**, not passed manually. Built via `inspect.signature()` to
+   read each parameter's name/type/default, then `pydantic.create_model()`
+   to build a throwaway model and call `.model_json_schema()` on it —
+   reusing Pydantic's own schema generation rather than writing a
+   hand-rolled Python-type-to-JSON-Schema mapper. Hit one `mypy --strict`
+   gotcha here: `create_model(name, **fields)` with a dynamically-built
+   `**fields` dict makes mypy lose precise type tracking and infer `Any`
+   for the resulting model — annotating the intermediate variable
+   (`schema: dict[str, Any] = model.model_json_schema()`) fixed it, since
+   mypy trusts an explicit annotation over inference through
+   metaprogramming-heavy calls like this.
+2. **Dropped the spec's `idempotency=` parameter entirely** — a genuine
+   spec inconsistency, not a style choice: section 11's own idempotency
+   key formula (`sha256(run_id + seq + tool_name + canonical_json(args))`)
+   never actually branches on that parameter's value in any example given.
+   A parameter with zero observable effect on behavior is worse than no
+   parameter — can be reintroduced if a real second strategy ever shows up.
+
+`requires_approval` accepts either a plain `bool` or a predicate
+(`Callable[[dict[str, Any]], bool]`) and is normalized into a callable
+internally via `isinstance(requires_approval, bool)` — chosen over
+`callable()` for the narrowing check specifically because `mypy` reliably
+recognizes `isinstance` as narrowing a `bool | Callable` union, where
+`callable()` isn't guaranteed to for an arbitrary `Callable[...]` shape.
+This means calling code (the orchestrator, later) never needs to check
+which form was originally passed — it just calls
+`tool.requires_approval(args)` uniformly.
+
+`idempotency_key(run_id, seq, tool_name, arguments)` implements spec
+section 11's formula directly, using `json.dumps(..., sort_keys=True)` for
+canonicalization. Verified manually: the same arguments produce the same
+key regardless of dict insertion order, and changing `seq` alone changes
+the key (i.e. a retry of the *same* logical step reuses a key; a
+*different* step never collides with one).
+
+### tools/refund_tools.py — the three demo tools
+
+`lookup_order`, `check_refund_policy`, `issue_refund`, backed by a plain
+in-memory dict (`_ORDERS`) — no real payments API exists anywhere in this
+project, by design (spec section 16 Layer 8: *"there is no version of
+this where your test suite can issue a real refund"*). Deliberately no
+attempt-ledger tracking yet (the `FakeRefundAPI` with `.attempts`/
+`.refunds` from spec section 16 Layer 2) — that's explicit Week 3 scope
+once idempotency/crash-resume testing actually needs it; building it now
+would be ahead of what this week's work requires.
+
+Noted but not resolved (a Week 3 concern): spec section 11's `issue_refund`
+signature has no `idempotency_key` parameter, but section 16's
+`FakeRefundAPI.issue_refund` does — and the worked example's
+`provider_dedup_hit: true` (section 15) only makes sense if the backend
+itself receives the idempotency key to dedupe against. Section 11's
+simpler signature was followed for now since Week 2 doesn't yet wire up
+real idempotency handling; Week 3's orchestrator work will need to settle
+which shape is correct.
+
+Verified manually end-to-end: order lookup succeeds and fails correctly
+for an unknown id, policy check correctly flags the demo order (damaged)
+as eligible for its full amount, the approval threshold fires at exactly
+the right boundary, and `issue_refund` returns a result.
+
+**Full verification:** `mypy --strict` clean across all new files
+(`llm/protocol.py`, `llm/scripted.py`, `tools/registry.py`,
+`tools/refund_tools.py`).
+
+### What's still not here (superseded — see Iteration 6)
+
+`orchestrator.py` itself — the loop that actually ties `ScriptedLLM` and
+these three tools together into a running trajectory. Still the user's
+own file to write.
+
+---
+
+## Iteration 6 — orchestrator.py, and a full run verified end-to-end (Week 2, Day 1 continued)
+
+Also on the user's own "write yourself" list — fourth and last of the four
+files, same override pattern as `events.py`/`state.py`: the conflict with
+`CLAUDE.md` was named explicitly, a middle-ground option offered, user
+chose full override.
+
+### The key structural insight: reconciliation and normal operation are the same code path
+
+Spec section 9's 11-step loop lists "reconcile in-flight ops" as step 2,
+sitting right after "load events, rebuild state" — easy to read that as a
+special case bolted onto crash recovery. It isn't. Because the loop
+reloads events and rebuilds state fresh at the top of *every* iteration,
+it structurally cannot distinguish "I appended this Requested a
+microsecond ago, in this same process" from "a different process
+appended this Requested three minutes ago and then died." Both look
+identical: a dangling `Requested` with no matching `Completed`. So there
+is exactly one code path — `_reconcile()` — that handles both, and it's
+being exercised in ordinary Week 2 operation right now, not just
+theoretically waiting for Week 3's chaos tests. That's the payoff of the
+"reload every iteration looks wasteful, it's deliberate" note in spec
+section 9 taken literally rather than as a throwaway line.
+
+Concretely, the loop's shape ended up as:
+
+```
+read events, rebuild state
+if completed/failed/awaiting_approval -> return state
+if step or cost cap exceeded -> append RunFailed, loop again
+if state.in_flight is not None -> _reconcile() (finish whatever's pending), loop again
+otherwise -> decide_next_action(state), act on it, loop again
+```
+
+Every branch appends exactly one event and loops back to the top, rather
+than returning early from inside a branch — the only two exit points are
+the terminal-status check at the very top. This mirrors `state.py`'s
+`apply()`/`rebuild_state()` split: a pure `decide_next_action(state) ->
+Decision` function (no I/O, easy to unit test in isolation) separated
+from the impure `Orchestrator` class that actually calls the store, the
+LLM, and the tools.
+
+### decide_next_action — how "what happens next" gets derived, not tracked
+
+No separate flag anywhere for "is there a pending tool call." Instead:
+look at `state.messages[-1]` (built by `state.py`'s `apply()`). If it's
+an assistant message with `tool_calls`, the first one hasn't been acted
+on yet (no tool-result message follows it) → `ExecuteTool`. If it's an
+assistant message with no `tool_calls`, the model gave its final answer →
+`Finish`. Otherwise (a `user` or `tool` message) → `CallLLM`. Three
+possible outcomes as a small closed union (`CallLLM | ExecuteTool |
+Finish`), same `assert_never`-in-`match` exhaustiveness pattern as
+`state.py`'s `apply()`.
+
+### Approval: requests and parks correctly, but can't yet resume
+
+Per spec section 13's exact flow (confirmed by re-reading the worked
+example in section 15 closely): when a tool needs approval, the
+orchestrator appends `ApprovalRequested` **instead of**
+`ToolCallRequested` — the actual `ToolCallRequested` only gets appended
+*after* approval is granted (spec's worked example: seq12
+`ApprovalRequested`, seq13 `ApprovalGranted`, seq14 `ToolCallRequested`).
+Implemented and verified: a tool call above the ₹5,000 threshold produces
+an `ApprovalRequested` and the run correctly reports
+`status="awaiting_approval"`, having called the LLM exactly once — no
+infinite loop re-requesting approval every iteration.
+
+**What's deliberately not built yet:** resuming a parked run after
+`ApprovalGranted` and actually executing the now-approved tool call. That
+needs a way to distinguish "this specific tool call was already approved"
+from "the predicate says yes, ask again" — genuinely Week 4 scope (the
+FastAPI approve/deny endpoints and the `resume()` entry point), not
+something to solve ahead of time.
+
+### Two other honest gaps, called out directly in the class docstring
+
+- `ToolCallCompleted.recovered` is hardcoded `False` for now. Week 2 never
+  actually kills a process mid-run, so there's no real recovery to detect
+  yet — Week 3's chaos-test work will need a genuine mechanism (likely:
+  the orchestrator tracking, in local memory for its own single
+  invocation, which `seq`s it itself requested — a `Completed` for a `seq`
+  it didn't request itself is a real recovery).
+- No idempotency dedup check before executing a tool, and
+  `tools/refund_tools.py`'s `issue_refund` doesn't even accept an
+  `idempotency_key` parameter yet. A real crash-and-resume against it
+  today would genuinely double-execute with zero protection — this is
+  the exact gap flagged back in Iteration 5 between spec sections 11 and
+  16's differing `issue_refund` signatures, still unresolved, still
+  correctly deferred to Week 3.
+
+A nice side effect of the design: the model hallucinating a nonexistent
+tool name (a scenario spec section 16's record/replay list names
+explicitly) is handled gracefully — `_request_tool_call` appends a
+`ToolCallFailed` with a clear error message rather than raising, since
+looking the tool name up in the registry dict and getting nothing back is
+cheap to check for.
+
+### Verified end-to-end, not just type-checked
+
+Ran a full scripted trajectory through `Orchestrator.run()` against
+`ScriptedLLM` and the real `lookup_order`/`check_refund_policy`/
+`issue_refund` tools (refund amount kept at ₹3,000 — under the approval
+threshold — specifically so the run could reach `RunCompleted` without
+needing Week 4's approval-granting machinery): the resulting event trace
+was `RunStarted` → 3×[`LLMCallRequested`, `LLMCallCompleted`,
+`ToolCallRequested`, `ToolCallCompleted`] → final
+[`LLMCallRequested`, `LLMCallCompleted`] → `RunCompleted` — an exact
+structural match to spec section 15's own worked example shape. Final
+state: `status="completed"`, correct final answer, correctly accumulated
+`total_tokens`/`total_cost_usd`. This is Week 2's stated "done when" bar
+(spec section 18): *"`replay <run_id>` prints a complete, readable trace
+of a successful run"* — met, even without a polished `replay` command
+built yet (the trace was printed by the verification script directly from
+`store.read()`).
+
+Separately verified the approval-park path (above), and reran the full
+existing test suite plus `mypy --strict` across all 27 source files —
+everything still green, nothing broken by this addition.
+
+### What's still not here
+
+A formal, committed test file for the orchestrator (the verification
+above was a manual script, same pattern as `postgres.py`'s Iteration 3
+check — not yet `tests/`). A polished `replay` CLI command. Resuming a
+parked approval (Week 4). `guardrails/decisions.py` remains the user's
+last untouched write-yourself file, Week 5 scope.

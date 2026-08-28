@@ -80,8 +80,8 @@ RunStatus = Literal["not_started", "running", "awaiting_approval", "completed", 
 class RunState:
     """The complete state of one run, derived entirely from its event log.
 
-    No run_id field, unlike the version sketched in docs/SPEC.md section 8:
-    rebuild_state operates on a list[Event] alone, and Event objects never
+    No run_id field: rebuild_state operates on a list[Event] alone, and
+    Event objects never
     carry run_id (it lives only as a database column — see
     storage/postgres.py). Whoever calls rebuild_state already has the
     run_id, since they had to pass it to EventStore.read() to get these

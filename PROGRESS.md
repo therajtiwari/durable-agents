@@ -78,11 +78,53 @@
 - **Week 1 is functionally complete** per spec section 18's scope. Full
   detail: `docs/BUILD_LOG.md` iteration 4.
 
-## Next — Week 2: The agent loop
+## Week 2, Day 1 — LLM client + tool registry built
 
-- LLM client (`llm/protocol.py` + `ScriptedLLM` first — real Anthropic
-  client and retries/cost tracking can wait)
-- Tool registry + the three refund tools
-- `orchestrator.py` — on the user's own list, not Claude's
-- Step cap and cost cap
-- `replay <run_id>` printing a full trace of a successful run
+- `llm/protocol.py`: `LLMClient` ABC (consistent with `EventStore`'s
+  ABC choice — asked again rather than assumed), `LLMResponse` reusing
+  `ToolCallInvocation` from `events.py`.
+- `llm/scripted.py`: `ScriptedLLM`. Ships in the real package (unlike
+  `refund_tools.py`) — generic testing infra any consumer needs, not
+  demo-specific.
+- `tools/registry.py`: `@tool` decorator, JSON schema auto-derived from
+  function type hints via Pydantic's `create_model`. Dropped the spec's
+  `idempotency=` parameter — its own formula never actually used the
+  value. `idempotency_key()` implements spec section 11's sha256 formula.
+- `tools/refund_tools.py`: `lookup_order`, `check_refund_policy`,
+  `issue_refund` — in-memory demo data, no attempt-ledger yet (that's
+  Week 3, once crash-resume testing needs it).
+- All verified manually (schema derivation, approval threshold,
+  idempotency key stability/uniqueness, tool execution). `mypy --strict`
+  clean. Full detail: `docs/BUILD_LOG.md` iteration 5.
+
+## Week 2, Day 1 (continued) — orchestrator.py built and verified end-to-end
+
+- `orchestrator.py` written (fourth and last write-yourself file, same
+  override pattern as the previous three). Key insight: reconciliation
+  (spec's step 2) and normal operation are literally the same code path
+  — the loop reloads state fresh every iteration and can't structurally
+  tell "requested a moment ago" from "requested by a dead process."
+  `decide_next_action(state)` is a pure function (`CallLLM | ExecuteTool
+  | Finish`), same `assert_never` exhaustiveness pattern as `state.py`.
+- Approval requests/parks correctly (`ApprovalRequested` instead of
+  `ToolCallRequested`, matching spec section 13's exact flow) — verified
+  it calls the LLM exactly once and doesn't loop. Resuming after
+  `ApprovalGranted` is correctly left for Week 4.
+- Two gaps called out directly in the code: `recovered` is hardcoded
+  `False` (no real crash exercised yet), and no idempotency dedup check
+  before executing a tool (Week 3 scope, matches the signature gap
+  flagged in `refund_tools.py`).
+- **Verified end-to-end**, not just type-checked: full scripted run
+  through the real tools reached `RunCompleted` with the exact event
+  trace shape from spec's worked example. This meets Week 2's "done
+  when" bar. Full detail: `docs/BUILD_LOG.md` iteration 6.
+- Full regression: `mypy --strict` clean across all 27 files, all 11
+  existing tests still passing.
+
+## Next — Week 2 wrap-up / Week 3 prep
+
+- Formal committed test file for the orchestrator (current verification
+  is a manual script, not `tests/`)
+- Polished `replay <run_id>` CLI command
+- Week 3: in-flight reconciliation is already built — next is real
+  idempotency dedup + fake tool APIs with attempt ledgers + chaos tests
