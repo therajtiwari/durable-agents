@@ -703,10 +703,148 @@ Separately verified the approval-park path (above), and reran the full
 existing test suite plus `mypy --strict` across all 27 source files —
 everything still green, nothing broken by this addition.
 
-### What's still not here
+### What's still not here (superseded — see Iteration 7)
 
 A formal, committed test file for the orchestrator (the verification
 above was a manual script, same pattern as `postgres.py`'s Iteration 3
 check — not yet `tests/`). A polished `replay` CLI command. Resuming a
 parked approval (Week 4). `guardrails/decisions.py` remains the user's
 last untouched write-yourself file, Week 5 scope.
+
+---
+
+## Iteration 7 — formal orchestrator tests, and a real bug they caught (Week 2, Day 1 continued)
+
+### The bug: ToolCallFailed left the loop with no way to move on
+
+Writing `tests/unit/test_orchestrator.py` surfaced a genuine correctness
+bug in `state.py`, not just a missing test case. `apply()`'s handling of
+`ToolCallFailed` left `state` completely unchanged — copied from
+`LLMCallFailed`'s reasoning ("stays dangling until a Completed clears
+it"). That reasoning is correct for `LLMCallFailed`: an `LLMCallRequested`
+was already appended, so `in_flight` stays set, and the next loop
+iteration retries safely through `_reconcile()` (no side effect, cheap).
+
+It's wrong for the specific case of a hallucinated tool name. When a
+model calls a tool that doesn't exist in the registry, `orchestrator.py`
+appends `ToolCallFailed` directly — there was never a `ToolCallRequested`
+for it, so there's no `in_flight` to retry through. With `state`
+unchanged, `decide_next_action` re-reads the exact same last assistant
+message, sees the same unresolved `tool_calls` pointing at the same bad
+name, and requests the identical tool again. Infinite loop: `seq`
+climbing forever, the run never terminating.
+
+**The fix:** `ToolCallFailed` now behaves like `ToolCallCompleted` —
+clears `in_flight` and appends a `tool`-role message carrying the error
+text, so the model actually sees the failure on its next turn and decides
+what to do (try something else, apologize, whatever). This also sharpens
+the real distinction between the two `Failed` events, which the original
+code didn't express: an LLM failure is a transient infra error, safe to
+blindly auto-retry; a tool failure could be a bad name, bad arguments, or
+a genuine business error — not something the orchestrator should retry
+on its own initiative. The model should be the one to decide.
+
+Worth being honest about this rather than glossing over it: this bug
+existed in already-reviewed, already-tested code (`state.py` passed
+`mypy --strict` and 7 unit tests when it was written). It only surfaced
+because a *different* component (`orchestrator.py`) started exercising a
+code path (`ToolCallFailed` with no prior `ToolCallRequested`) that
+`state.py`'s own unit tests never had reason to construct. This is
+exactly the value integration-shaped tests provide over pure unit tests
+in isolation — neither layer alone would have caught it.
+
+### tests/unit/test_orchestrator.py — 5 tests, no real Postgres
+
+Uses a small `InMemoryEventStore` (a fake `EventStore` implementation,
+private to this test file) rather than the real Postgres-backed one —
+these tests are about the orchestrator's *decisions*, already separated
+from storage correctness (covered independently by
+`tests/integration/test_postgres_store.py`). Mirrors
+`PostgresEventStore`'s own concurrency rule (append only at the next
+sequential `seq`) with a plain dict, so a genuine `ConcurrencyConflict`
+would still be caught if the orchestrator ever violated it.
+
+Five cases:
+- **Full run reaches `RunCompleted`** — the same scenario as Iteration
+  6's manual script, now committed and repeatable.
+- **Approval required parks without looping** — asserts `llm.call_count
+  == 1` and the exact three-event tail (`LLMCallRequested`,
+  `LLMCallCompleted`, `ApprovalRequested`), proving it stops rather than
+  re-requesting approval indefinitely.
+- **Hallucinated tool recovers instead of looping** — the test that
+  caught the bug above. Asserts the LLM gets called a *second* time after
+  the failure (`llm.call_count == 2`), which would fail immediately
+  (`IndexError: list index out of range` from `ScriptedLLM` running out
+  of scripted responses) if the infinite-loop bug were still present.
+- **Step cap exceeded fails the run** — a script that would otherwise run
+  10 rounds, capped at `max_steps=1`, confirms `RunFailed` with the right
+  reason and that the loop doesn't run past the cap.
+- **Cost cap exceeded fails the run** — same shape, for
+  `max_cost_usd`.
+
+**Full verification:** `mypy --strict` clean across all 28 source files
+(the new test file plus the `state.py` fix), all 16 tests passing (11
+from before + 5 new).
+
+### Week 2 status (superseded — see Iteration 8)
+
+Both remaining Week 2 loose ends from Iteration 6 are now down to one:
+the orchestrator has committed, repeatable tests. Still open: a polished
+`replay <run_id>` CLI command, and resuming a parked approval (correctly
+Week 4 scope).
+
+---
+
+## Iteration 8 — replay CLI command, Week 2 fully complete (Week 2, Day 1 continued)
+
+### cli.py — not on the write-yourself list, built directly
+
+One dependency question settled first: `argparse` (stdlib) over `typer`
+(nicer DX, but a new runtime dependency for something this small doesn't
+earn its keep yet — a handful of simple subcommands doesn't need a
+dedicated CLI framework).
+
+`replay <run_id>` reads every event for a run from Postgres and prints
+one line per event, then a summary (status, steps, tokens, cost,
+duration). The per-event formatting is a `match`/`case` over `Event`
+(the same `assert_never` exhaustiveness pattern used throughout —
+`state.py`'s `apply()`, `orchestrator.py`'s decision handling, now this),
+split into a small `_event_detail()` function that returns just the
+type-specific fields, with alignment (`{type_name:<18}`) handled once at
+the call site rather than baked into every branch — avoids the kind of
+manual-spacing bugs that come from hand-aligning 13 separate f-strings.
+
+DSN resolution: `--dsn` flag, falling back to a `DATABASE_URL` environment
+variable, falling back to the same default credentials
+`docker-compose.yml` already uses. `.env.example` — empty since Iteration
+1's scaffolding — got its first real content:
+`DATABASE_URL=postgresql://...`.
+
+### Verified as an actual command-line invocation, not just a function call
+
+Created a fresh full run through `Orchestrator` (same scenario as
+Iteration 6/7), then ran `python -m durable_agents.cli replay <run_id>`
+as a genuine subprocess — not calling `_replay()` directly from another
+script. Output read almost identically to spec section 15's own worked
+example table: every `RunStarted`/`LLMCallRequested`/`LLMCallCompleted`/
+`ToolCallRequested`/`ToolCallCompleted`/`RunCompleted` on its own line,
+with the right step numbers, tool arguments, token counts, costs, and a
+final summary line. Also checked the empty case — a `run_id` with no
+events prints a clear message and exits cleanly rather than crashing.
+
+**This is the actual "done when" bar for Week 2**, stated directly in
+spec section 18: a full, readable trace of a successful run, with zero
+dedicated logging code written to produce it — every field printed came
+straight out of the event log Week 1 built.
+
+**Full verification:** `mypy --strict` clean across all 28 source files,
+full existing test suite (16 tests) still passing.
+
+### Week 2 — fully complete
+
+Everything in spec section 18's Week 2 scope now exists and is verified:
+LLM client + `ScriptedLLM`, tool registry + the three refund tools,
+`orchestrator.py` (with tests), step/cost caps, and `replay`. The only
+things intentionally not built are explicitly later weeks' scope:
+resuming a parked approval (Week 4), real idempotency dedup and fake
+tool APIs with attempt ledgers (Week 3), guardrails (Week 5).

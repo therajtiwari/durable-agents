@@ -170,9 +170,24 @@ def apply(state: RunState, event: Event) -> RunState:
             )
 
         case ToolCallFailed():
-            # Same reasoning as LLMCallFailed: the tool call stays
-            # dangling until a Completed (recovered or fresh) clears it.
-            return state
+            # Unlike LLMCallFailed, this clears in_flight rather than
+            # leaving it dangling: a tool failure (bad name, bad
+            # arguments, a real business error) isn't automatically safe
+            # to blindly auto-retry the way an LLM call is. Surface it to
+            # the model as a tool-result message instead, so it decides
+            # what to do next rather than the orchestrator looping on the
+            # same failing call forever.
+            message = Message(
+                role="tool",
+                content=f"Error: {event.error}",
+                tool_name=event.tool,
+            )
+            return replace(
+                state,
+                step=event.step,
+                in_flight=None,
+                messages=[*state.messages, message],
+            )
 
         case GuardrailTriggered():
             hit = GuardrailHit(

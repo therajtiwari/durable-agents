@@ -121,10 +121,47 @@
 - Full regression: `mypy --strict` clean across all 27 files, all 11
   existing tests still passing.
 
-## Next — Week 2 wrap-up / Week 3 prep
+## Week 2, Day 1 (continued) — formal orchestrator tests, real bug caught and fixed
 
-- Formal committed test file for the orchestrator (current verification
-  is a manual script, not `tests/`)
-- Polished `replay <run_id>` CLI command
-- Week 3: in-flight reconciliation is already built — next is real
-  idempotency dedup + fake tool APIs with attempt ledgers + chaos tests
+- `tests/unit/test_orchestrator.py` (5 tests, `InMemoryEventStore` fake —
+  no real Postgres needed, orchestrator logic only): full run to
+  completion, approval parks without looping, hallucinated tool recovers,
+  step cap fails, cost cap fails.
+- **Real bug found and fixed:** `state.py`'s `ToolCallFailed` handling
+  left `state` unchanged (copied from `LLMCallFailed`'s reasoning, which
+  doesn't apply here) — caused an infinite loop when a model hallucinates
+  a nonexistent tool, since there's no `in_flight` to retry through and
+  `decide_next_action` kept re-requesting the same bad tool forever.
+  Fixed: `ToolCallFailed` now clears `in_flight` and feeds the error back
+  as a `tool`-role message, same shape as `ToolCallCompleted`, so the
+  model gets to react instead of the loop stalling. Caught by writing
+  the orchestrator test, not by `state.py`'s own unit tests — a real
+  integration-vs-unit-test lesson. Full detail: `docs/BUILD_LOG.md`
+  iteration 7.
+- All 16 tests passing, `mypy --strict` clean across 28 files.
+
+## Week 2, Day 1 (continued) — replay CLI, Week 2 fully complete
+
+- `cli.py` written: `replay <run_id>` subcommand (`argparse`, stdlib —
+  chose over `typer` to avoid a new dependency for one small command).
+  Prints every event as one readable line + a final summary (status,
+  steps, tokens, cost, duration), sourced entirely from the event log.
+- `.env.example` got its first real content: `DATABASE_URL=...`.
+- Verified as a genuine subprocess invocation
+  (`python -m durable_agents.cli replay <run_id>`) against a fresh real
+  run — output matches spec's own worked-example table shape closely.
+  Empty-run case handled gracefully.
+- **This is Week 2's actual "done when" bar, met.** Full detail:
+  `docs/BUILD_LOG.md` iteration 8.
+- `mypy --strict` clean across 28 files, all 16 tests still passing.
+
+**Week 2 is now fully complete.**
+
+## Next — Week 3: Crash and resume ("the week that matters")
+
+- In-flight reconciliation is already built (Week 2's orchestrator design
+  handles it structurally) — next: real idempotency dedup (the
+  already-completed check before executing a tool), fake tool APIs with
+  attempt ledgers (`FakeRefundAPI`-style, tracking `.attempts`/`.refunds`
+  separately from the event log), and the chaos test suite (SIGKILL at
+  every seq, assert exactly-once).
