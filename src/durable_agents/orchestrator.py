@@ -95,12 +95,6 @@ class Orchestrator:
     - Approval can be REQUESTED and the run correctly parks, but nothing
       here can GRANT it and resume the approved tool call — that's Week 4
       (the FastAPI endpoints + the resume entry point).
-    - `recovered` is always False on ToolCallCompleted. No process is
-      ever actually killed mid-run yet, so genuine recovery is never
-      exercised — chaos tests need a real mechanism to detect it (this
-      loop can't structurally tell "same process, moments ago" from
-      "different process, minutes ago," which is correct for safety but
-      means it can't self-report which one happened).
     """
 
     def __init__(
@@ -133,6 +127,15 @@ class Orchestrator:
         # it happens inside one reconcile() call between two appends.
         self._kill_after_seq = kill_after_seq
         self._kill_after_tool_execution_seq = kill_after_tool_execution_seq
+        # Tracks, for the current run() call only, which seqs THIS
+        # invocation itself appended a Requested for. Reset at the top of
+        # every run() call — a dangling op already sitting in the log
+        # before this invocation even started reading events is a real
+        # recovery, whether that's because a different process died or
+        # because a previous, separate run() call on this same instance
+        # left it (run() only returns once in_flight is resolved, so in
+        # practice this only ever means "a different process").
+        self._requested_this_run: set[int] = set()
 
     def _maybe_chaos_kill(self) -> None:
         # SIGKILL doesn't exist on Windows. os.kill() there calls
@@ -148,6 +151,7 @@ class Orchestrator:
             self._maybe_chaos_kill()
 
     async def run(self, run_id: UUID) -> RunState:
+        self._requested_this_run = set()
         while True:
             events = await self._store.read(run_id)
             state = rebuild_state(events)
@@ -178,7 +182,8 @@ class Orchestrator:
                 continue
 
             if state.in_flight is not None:
-                await self._reconcile(run_id, next_seq, now, state)
+                recovered = state.in_flight.seq not in self._requested_this_run
+                await self._reconcile(run_id, next_seq, now, state, recovered)
                 continue
 
             decision = decide_next_action(state)
@@ -255,6 +260,7 @@ class Orchestrator:
             return
 
         key = idempotency_key(run_id, next_seq, tool_call.name, tool_call.arguments)
+        self._requested_this_run.add(next_seq)
         await self._append(
             run_id,
             next_seq,
@@ -270,7 +276,7 @@ class Orchestrator:
         )
 
     async def _reconcile(
-        self, run_id: UUID, next_seq: int, now: datetime, state: RunState
+        self, run_id: UUID, next_seq: int, now: datetime, state: RunState, recovered: bool
     ) -> None:
         op = state.in_flight
         assert op is not None
@@ -323,7 +329,7 @@ class Orchestrator:
                     idempotency_key=op.idempotency_key or "",
                     result=result,
                     duration_ms=duration_ms,
-                    recovered=False,
+                    recovered=recovered,
                     provider_dedup_hit=provider_dedup_hit,
                 ),
             )

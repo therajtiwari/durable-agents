@@ -1051,7 +1051,7 @@ files, all 36 tests passing (20 existing + 16 chaos) in ~33 seconds total
 — real process spawns and real Postgres I/O throughout, still fast enough
 to run routinely.
 
-### Week 3 status
+### Week 3 status (superseded — see Iteration 11)
 
 The chaos suite is green across every meaningful kill point in the
 canonical run, including the specific gap spec calls out as the one
@@ -1062,3 +1062,125 @@ a real mechanism for `ToolCallCompleted.recovered` (still hardcoded
 `False` — every chaos test above proves resume works correctly without
 ever needing to *report* whether recovery happened, which is exactly the
 point, but the field itself still isn't populated honestly).
+
+---
+
+## Iteration 11 — start/resume as real CLI commands (Week 3, Day 1 continued)
+
+### Extracted the canonical demo scenario to avoid duplicating it a second time
+
+`tests/chaos/scenario_runner.py`'s scripted responses + `RunStarted`
+payload needed to be reused by `cli.py` too — duplicating them a second
+time was exactly the kind of drift risk this project has avoided
+elsewhere (the idempotency formula, the payload-shape decision). Moved
+both into a new `tools/refund_demo_scenario.py`
+(`canonical_script()`, `canonical_run_started()`) — demo content, same
+category as `refund_tools.py` itself, so it'll move together with it
+during the Week 6 packaging cleanup already noted. `scenario_runner.py`
+now imports from there instead of defining its own local copy.
+
+### cli.py — start and resume, deliberately the same function
+
+`_start_or_resume(run_id, dsn)` is called by both the new `start`
+subcommand (generates a fresh `run_id`) and `resume` (takes an existing
+one) — mirroring `orchestrator.run()`'s own philosophy directly in the
+CLI's structure: starting is just resuming from an empty log, so there's
+no reason for two separate code paths pretending otherwise.
+
+Honest limitation stated directly in the docstring rather than hidden:
+this only runs the one fixed canonical refund scenario — there's still
+no real LLM client built (`llm/anthropic_client.py` remains an empty
+scaffold), so `start` can't yet accept an arbitrary goal. `ScriptedLLM`'s
+resume position is recovered the same way `scenario_runner.py` already
+does it — counting existing `LLMCallCompleted` events and slicing the
+script accordingly.
+
+### Verified two ways
+
+1. Plain `start` — completed the full scenario in one shot, as expected.
+2. **Simulated an interrupted run manually** (a separate script appends
+   only `RunStarted`, nothing else — standing in for "a process died
+   immediately after this"), then ran `resume <run_id>` as a genuinely
+   separate command several seconds later. The resulting trace shows a
+   real ~8-second gap between `seq 0` and `seq 1`'s timestamps — matching
+   the actual wall-clock time between the two commands — proof `resume`
+   picked up the existing partial log rather than silently starting over.
+
+**Full regression:** `mypy --strict` clean across 33 source files, all 36
+tests still passing.
+
+### Week 3 status (superseded — see Iteration 12)
+
+Both loose ends from Iteration 10 are now down to one:
+`resume(run_id)` is a real, user-facing command. Still open: a genuine
+mechanism for `ToolCallCompleted.recovered` (still hardcoded `False`).
+
+---
+
+## Iteration 12 — real recovered detection, Week 3 fully complete (Week 3, Day 1 continued)
+
+### The mechanism: track what THIS invocation itself requested
+
+Definition settled on: a `ToolCallCompleted` is genuinely `recovered`
+when `Orchestrator._reconcile()` finishes a `ToolCallRequested` that
+*this specific call* to `run()` did not itself append. If it's already
+sitting dangling in the log the moment `run()` starts reading events,
+that's a real recovery — whether the cause is a different process
+crashing, or (in principle) an earlier separate call to `run()` on the
+same instance, since `run()` only ever returns once any in-flight op is
+resolved.
+
+Implementation: `Orchestrator` gained `self._requested_this_run: set[int]`,
+reset to empty at the very top of every `run()` call.
+`_request_tool_call` adds `next_seq` to it right before appending a real
+`ToolCallRequested`. The in-flight check in the main loop now computes
+`recovered = state.in_flight.seq not in self._requested_this_run` before
+calling `_reconcile()`, which threads that bool straight onto
+`ToolCallCompleted.recovered` instead of the old hardcoded `False`.
+`LLMCallCompleted` has no such field — only tool calls carry real
+side-effect-recovery risk worth flagging, so nothing needed tracking
+there.
+
+### Verified against both a clean run and a genuine kill
+
+Ran the canonical scenario twice: once uninterrupted (all three
+`ToolCallCompleted`s correctly show `recovered=False`), once with
+`CHAOS_KILL_AFTER_SEQ=11` (kills right after `issue_refund`'s own
+`ToolCallRequested`, before the killed process ever executes it) — the
+resumed process's completion for that exact step showed `recovered=True`,
+the other two (never interrupted) stayed `False`. This is the literal
+"money shot" field from spec's own worked example (section 15's
+`recovered: true` on the resumed `ToolCallCompleted`), now genuinely
+computed rather than hardcoded.
+
+Also strengthened `tests/chaos/test_chaos.py`'s dedicated nastiest-bug
+test with `assert recovered is True` — required extracting the
+`ToolCallCompleted` event itself from `_verify()`'s return value, using
+an `isinstance`-narrowable `assert` on the discriminated `type` field so
+`mypy --strict` accepts `.recovered` access on what's otherwise a 13-way
+`Event` union.
+
+**Full regression:** `mypy --strict` clean across 33 source files, all 36
+tests passing, all 16 chaos tests still green including the strengthened
+assertion.
+
+### A separate finding, noted but deliberately not fixed here
+
+While reasoning through this, noticed the main loop checks step/cost
+caps *before* checking `state.in_flight` — meaning if a run hits its cap
+while a tool call is genuinely dangling (`ToolCallRequested` with no
+`Completed`), `RunFailed` could get appended while that side effect
+remains permanently unresolved and unrecorded. This is a different,
+unrelated correctness question from anything built this iteration —
+flagged for a future decision rather than silently bundled into this
+change, per the project's own rule about one concern per change.
+
+### Week 3 — fully complete
+
+Every item in spec section 18's Week 3 scope now exists and is verified:
+in-flight reconciliation (built in Week 2, exercised for real here),
+idempotency keys and the already-completed check, the `resume(run_id)`
+entry point, a fake tool API with attempt ledgers persisted across real
+process restarts, the chaos test suite across every meaningful kill
+point, and now genuine `recovered` reporting. `guardrails/decisions.py`
+remains the user's last untouched write-yourself file — Week 5 scope.

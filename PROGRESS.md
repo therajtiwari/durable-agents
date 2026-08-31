@@ -201,10 +201,73 @@
 - Full regression: `mypy --strict` clean across 32 files, 36/36 tests
   passing (~33s total). Full detail: `docs/BUILD_LOG.md` iteration 10.
 
-## Next — Week 3 wrap-up
+## Week 3, Day 1 (continued) — start/resume as real CLI commands
 
-- `resume(run_id)` as a first-class `cli.py` command (currently only the
-  test-only chaos runner script exercises resumability).
-- A real mechanism for `ToolCallCompleted.recovered` (still hardcoded
-  `False` — resume works correctly regardless, but the field itself
-  isn't populated honestly).
+- Extracted the canonical demo scenario (scripted responses +
+  `RunStarted`) out of `scenario_runner.py` into
+  `tools/refund_demo_scenario.py`, avoiding a second copy — both the
+  chaos runner and `cli.py` now import the same source.
+- `cli.py`: `start` and `resume` subcommands, both calling the same
+  `_start_or_resume()` — mirrors `orchestrator.run()`'s own "starting is
+  just resuming from empty" philosophy directly in the CLI.
+- Verified `resume` genuinely picks up a manually-simulated interrupted
+  run (only `RunStarted` present) — the resulting trace shows a real
+  ~8-second gap between `seq 0` and `seq 1`, matching actual wall-clock
+  time between the two separate commands.
+- Honest limitation stated in the code: only runs the fixed demo
+  scenario for now, since no real LLM client exists yet.
+- Full regression: `mypy --strict` clean across 33 files, 36/36 tests
+  passing. Full detail: `docs/BUILD_LOG.md` iteration 11.
+
+## Week 3, Day 1 (continued) — real recovered detection, Week 3 fully complete
+
+- `orchestrator.py`: `self._requested_this_run: set[int]`, reset per
+  `run()` call. `recovered = state.in_flight.seq not in
+  self._requested_this_run` — true whenever a dangling op was already
+  sitting in the log before this invocation started, not appended by it.
+- Verified against both a clean run (all `recovered=False`) and a real
+  kill-and-resume (`CHAOS_KILL_AFTER_SEQ=11`) — the resumed process's
+  completion correctly showed `recovered=True`, matching spec's own
+  worked example exactly.
+- Strengthened the chaos suite's nastiest-bug test with
+  `assert recovered is True`.
+- Separate finding, not fixed here: step/cost caps are checked *before*
+  the in-flight check in the main loop — a run could hit its cap while a
+  tool call is genuinely dangling, leaving that side effect permanently
+  unresolved. Flagged for a future decision, not bundled into this change.
+- Full regression: `mypy --strict` clean across 33 files, 36/36 tests
+  passing (16/16 chaos). Full detail: `docs/BUILD_LOG.md` iteration 12.
+
+**Week 3 is now fully complete.**
+
+## Next — Week 4: Human-in-the-loop
+
+Two of spec's five Week 4 items are already done (from Week 2):
+`requires_approval` on tools, and clean park-and-exit on
+`ApprovalRequested`. Three genuinely new pieces, in the order planned:
+
+1. **Resuming after approval is granted** — `ApprovalGranted` currently
+   just clears `pending_approval`/sets status back to `running`; nothing
+   yet connects "this specific tool call was approved" to "now actually
+   issue its `ToolCallRequested`." Needs real design — how does the
+   orchestrator know a request that needed approval no longer does, for
+   this one instance?
+2. **The denial path** — `ApprovalDenied` also currently adds no message
+   anywhere, so the model never learns it was rejected. Same fix shape as
+   the `ToolCallFailed` bug from Week 2: feed the denial + reason back as
+   a message so the model can react instead of the loop just stalling.
+   (1) and (2) are tightly coupled — plan is to tackle them together.
+3. **FastAPI: approve, deny, status endpoints** — there is currently *no
+   way at all* to grant/deny an approval except manually appending the
+   event in a script. This is what makes the demo real for someone other
+   than us.
+4. **Two-worker concurrency test** — proves the `(run_id, seq)` PK
+   concurrency control works under real contention, not just Week 1's
+   isolated test. Found while planning: `orchestrator.py` doesn't
+   actually handle `ConcurrencyConflict` today — if two workers race,
+   the loser's `_append()` would raise and crash `run()` outright rather
+   than backing off and re-reading. This needs fixing as part of the
+   test, not just tested around.
+
+Planned order: (1)+(2) together, then FastAPI, then the concurrency fix
++ test.

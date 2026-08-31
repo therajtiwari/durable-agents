@@ -32,7 +32,7 @@ def _run_scenario(run_id: UUID, env_overrides: dict[str, str]) -> subprocess.Com
     )
 
 
-async def _verify(run_id: UUID, key: str) -> tuple[RunState, int]:
+async def _verify(run_id: UUID, key: str) -> tuple[RunState, int, bool]:
     pool = await asyncpg.create_pool(DSN, min_size=1, max_size=2)
     try:
         store = PostgresEventStore(pool)
@@ -42,7 +42,11 @@ async def _verify(run_id: UUID, key: str) -> tuple[RunState, int]:
             "SELECT COUNT(*) AS n FROM refund_ledger WHERE idempotency_key = $1", key
         )
         assert row is not None
-        return state, int(row["n"])
+        completion = next(
+            e for e in events if e.seq == ISSUE_REFUND_COMPLETE_SEQ and e.type == "ToolCallCompleted"
+        )
+        assert completion.type == "ToolCallCompleted"
+        return state, int(row["n"]), completion.recovered
     finally:
         await pool.close()
 
@@ -65,7 +69,7 @@ def test_resume_from_any_kill_point(kill_after_seq: int) -> None:
     assert resumed.returncode == 0, "resume should complete the run cleanly"
 
     key = idempotency_key(run_id, ISSUE_REFUND_REQUEST_SEQ, "issue_refund", ISSUE_REFUND_ARGS)
-    state, refund_count = asyncio.run(_verify(run_id, key))
+    state, refund_count, _recovered = asyncio.run(_verify(run_id, key))
 
     assert state.status == "completed"
     assert refund_count == 1
@@ -90,7 +94,8 @@ def test_kill_after_side_effect_before_completion_stays_exactly_once() -> None:
     assert resumed.returncode == 0
 
     key = idempotency_key(run_id, ISSUE_REFUND_REQUEST_SEQ, "issue_refund", ISSUE_REFUND_ARGS)
-    state, refund_count = asyncio.run(_verify(run_id, key))
+    state, refund_count, recovered = asyncio.run(_verify(run_id, key))
 
     assert state.status == "completed"
     assert refund_count == 1  # the tool really was called twice; only one refund exists
+    assert recovered is True  # the resumed process, not the killed one, finished this step
