@@ -848,3 +848,217 @@ LLM client + `ScriptedLLM`, tool registry + the three refund tools,
 things intentionally not built are explicitly later weeks' scope:
 resuming a parked approval (Week 4), real idempotency dedup and fake
 tool APIs with attempt ledgers (Week 3), guardrails (Week 5).
+
+---
+
+## Iteration 9 — real idempotency dedup + injectable ledger backend (Week 3, Day 1)
+
+First Week 3 work. Two of the week's five items — idempotency keys and
+fake tool APIs with attempt ledgers — turned out to be one coupled
+change, not two: the ledger's whole purpose is to be the thing the
+idempotency key gets checked against, so there was no meaningful way to
+build one without the other.
+
+### The key-injection problem, and why it needed a registry.py change
+
+`issue_refund` needs to receive the real `idempotency_key` (computed from
+`run_id + seq + tool_name + args`) so its backend can dedupe — but the
+model must never see or invent that value; it has nothing to do with the
+refund's business logic. Two things needed to change in
+`tools/registry.py`:
+
+1. **`_build_parameters_schema` now excludes a parameter literally named
+   `idempotency_key`** from the JSON schema sent to the LLM. Convention
+   over configuration — no new decorator flag needed; any tool that
+   declares this exact parameter name gets it excluded automatically.
+2. **`Tool` gained a `needs_idempotency_key: bool` field**, computed once
+   at decoration time by checking whether `idempotency_key` appears in
+   the wrapped function's own signature (`inspect.signature`). The
+   orchestrator reads this flag rather than trying to guess from the
+   tool's other metadata.
+
+`orchestrator.py`'s `_reconcile()` (the tool-execution branch) now checks
+`tool_obj.needs_idempotency_key` and, if true, adds
+`idempotency_key=op.idempotency_key` to the kwargs before calling
+`execute()` — separate from whatever arguments the LLM actually supplied.
+It also now reads `result.get("dedup_hit")` back from the tool's return
+value to set `ToolCallCompleted.provider_dedup_hit` correctly, instead of
+hardcoding `False` — this is the field spec section 15's worked example
+calls "the money shot," and it's now a real signal instead of a stub.
+
+### tools/refund_tools.py — from a hardcoded dict to an injectable backend
+
+This was deliberately deferred in Week 2 ("the module-level hardcoded
+dict was kept simple *because* this was coming" — Iteration 5). Rewritten
+around:
+
+- **`RefundBackend`** — a `Protocol` (not an ABC, unlike `EventStore`/
+  `LLMClient` — this is a private, internal backend abstraction rather
+  than a top-level system component, so the more informal structural
+  typing fit without needing the same consistency argument as the
+  public-facing interfaces).
+- **`InMemoryRefundBackend`** — the *only* backend this project has,
+  production and tests alike (no separate "real" vs "fake" implementation
+  — there is no real payments API anywhere in this project, a position
+  already established in Week 2). Tracks `.attempts` (every physical
+  call, unconditionally appended) and `.refunds` (keyed by idempotency
+  key — a repeat key returns the existing entry with `dedup_hit: True`
+  added, rather than creating a second refund).
+- **`build_refund_tools(backend) -> list[Tool]`** — a factory function
+  replacing the three bare module-level tool objects. Production code and
+  tests both call this, just with different backend instances.
+
+### Verified: the project's central assertion, now literally provable
+
+`tests/unit/test_refund_tools.py` (4 new tests) — the headline one calls
+`issue_refund.execute(..., idempotency_key="key-1")` twice and asserts:
+
+```python
+assert len(backend.attempts) == 2   # it really was attempted twice
+assert len(backend.refunds) == 1    # only one was ever actually created
+```
+
+This is spec section 16 Layer 2's exact assertion, previously only a
+line in the spec — now a passing test. Also verified: different
+idempotency keys create genuinely separate refunds (dedup doesn't
+over-trigger), and the schema exclusion actually works
+(`"idempotency_key" not in issue_refund.parameters["properties"]`).
+
+Also re-ran a full scripted `Orchestrator.run()` against real Postgres to
+confirm the whole pipeline still works end-to-end with the new backend
+shape — traced the exact same key from `tools/registry.py`'s
+`idempotency_key()` through `ToolCallRequested` → `InFlightOp` →
+injected into `execute()` → landing correctly in
+`backend.attempts`/`backend.refunds` → back out on `ToolCallCompleted`.
+
+**Full regression:** `mypy --strict` clean across 29 source files, 20/20
+tests passing (16 existing + 4 new). `tests/unit/test_orchestrator.py`
+needed a small update too — it imported the old bare tool objects
+directly; switched to `build_refund_tools(InMemoryRefundBackend())`.
+
+### What's still not here (superseded — see Iteration 10)
+
+The chaos test suite itself (real subprocess, real `SIGKILL`, assert
+exactly-once across every kill point) — this iteration built the
+*mechanism* the chaos tests will exercise, but no process has actually
+been killed yet. Also still open: the `resume(run_id)` entry point
+(mostly a thin `cli.py` wrapper around already-resumable
+`orchestrator.run()`), and `recovered` still hardcoded `False` on
+`ToolCallCompleted` (needs a real per-invocation tracking mechanism to
+detect genuine vs. same-process reconciliation).
+
+---
+
+## Iteration 10 — the chaos test suite: real SIGKILL, real resume, proven exactly-once (Week 3, Day 1 continued)
+
+Spec's own words for this week: "the week that matters." This is the
+piece that turns "durable" from a claim into something empirically
+proven, 16 times over, against a real killed process.
+
+### Windows has no SIGKILL — verified the fallback actually works before trusting it
+
+`signal.SIGKILL` doesn't exist as an attribute on Windows at all — spec's
+own chaos test snippet is POSIX-only. Rather than assume a fallback would
+behave equivalently, verified it directly first: a throwaway child
+process running `os.kill(os.getpid(), getattr(signal, "SIGKILL",
+signal.SIGTERM))` produced `returncode=15` and — critically — a `print`
+statement placed immediately *after* that line never executed. On
+Windows, `os.kill()` calls `TerminateProcess()` for any signal except
+Ctrl+C/Ctrl+Break, which is a genuinely abrupt kill (no cleanup handler
+runs), just not literally named `SIGKILL` on this platform. Confirmed
+before building anything on top of it, not assumed.
+
+### orchestrator.py — two kill hooks, not one, because they test different gaps
+
+`Orchestrator` gained `kill_after_seq` and `kill_after_tool_execution_seq`
+constructor parameters (both `None` in every real path — nothing sets
+them outside a test), plus a shared `_append()` wrapper that every event
+append now goes through (previously each call site hit
+`self._store.append` directly).
+
+Why two hooks: `kill_after_seq` fires right after an event is durably
+recorded — e.g. right after `ToolCallRequested`. At that exact point the
+tool was never actually called yet (execution happens in a *later* loop
+iteration's `_reconcile()`), so this hook only ever tests "resume calls
+the tool exactly once, having never called it before." Manually verified
+this directly: killing after seq 11 (`issue_refund`'s own
+`ToolCallRequested`) produced exactly one row in `refund_attempts` on
+resume, not two — the kill happened *before* any real attempt.
+
+Spec's actual "nastiest bug" — the side effect already ran, but nothing
+recorded that fact — happens entirely *inside* one `_reconcile()` call,
+between `tool_obj.execute()` returning and its `ToolCallCompleted` being
+appended. No event seq identifies that gap on its own; `kill_after_seq`
+structurally cannot reach it. `kill_after_tool_execution_seq` was added
+specifically for this: it fires right after `tool_obj.execute()` returns,
+keyed to the seq the resulting `Completed` *would* get. Manually verified
+this is the genuinely dangerous case: killing there produced two rows in
+`refund_attempts` but only one in `refund_ledger` on resume, and the
+resumed `ToolCallCompleted`'s own `result` showed `dedup_hit: True` —
+proof the backend's dedup mechanism actually engaged, not just that the
+count happened to come out right.
+
+### tests/chaos/scenario_runner.py — a standalone subprocess entry point, resumable across process restarts
+
+Deliberately not part of the public `cli.py` — this runs one fixed,
+canonical scripted scenario, reading `CHAOS_KILL_AFTER_SEQ` /
+`CHAOS_KILL_AFTER_TOOL_EXECUTION_SEQ` from the environment.
+
+One non-obvious bug found and fixed while building it: `ScriptedLLM`'s
+`call_count` starts at 0 in *every fresh process*. A resumed subprocess
+constructing a brand-new `ScriptedLLM(full_script)` would hand back
+`full_script[0]` for whatever its first real call turns out to be — even
+if that's actually the *third* logical LLM call in the run, because the
+first two were already completed (and recorded) by the process that got
+killed. Fixed by having the runner count existing `LLMCallCompleted`
+events in the log before constructing `ScriptedLLM`, and slicing the
+script to start from that position
+(`ScriptedLLM(full_script[already_completed:])`) — `ScriptedLLM` itself
+stays untouched; the fix is entirely in how the runner reconstructs its
+starting position from the log, which is itself a small example of the
+project's own core idea (derive position from the log, don't track it
+separately).
+
+A second bug, caught by the very first chaos test run (`kill_after_seq=0`
+failed with `returncode=0` — the process never actually died): `RunStarted`
+is appended directly by the runner script *before* an `Orchestrator`
+(and therefore its kill hook) is ever constructed, so `kill_after_seq=0`
+had no code path that could fire. Fixed with a small standalone check
+immediately after that specific append, mirroring the same kill logic.
+Worth remembering: the very first kill point tested is exactly the kind
+of edge case ("kill at the very start, before the main loop exists")
+that's easy to miss by construction, not by carelessness.
+
+### tests/chaos/test_chaos.py — 16 tests, real processes throughout
+
+`test_resume_from_any_kill_point`, parametrized over `kill_after_seq` in
+`range(0, 15)` (killing after seq 15 — `RunCompleted` — proves nothing,
+the run is already done): spawns a real subprocess with the kill env var
+set, asserts it actually died abruptly (`returncode != 0` — not
+comparing against an exact signal-derived value, since Windows'
+`TerminateProcess`-based codes don't follow POSIX's negative-signal
+convention), spawns a second subprocess to resume, then verifies via a
+*fresh* connection to Postgres (never trusting in-process state, since
+none of this test process's own state could have survived a real
+subprocess boundary anyway) that the run reached `completed` and exactly
+one row exists in `refund_ledger` for that exact idempotency key.
+
+`test_kill_after_side_effect_before_completion_stays_exactly_once` — the
+dedicated test for the nastiest-bug scenario above, same assertions.
+
+**All 16 pass.** Full regression: `mypy --strict` clean across 32 source
+files, all 36 tests passing (20 existing + 16 chaos) in ~33 seconds total
+— real process spawns and real Postgres I/O throughout, still fast enough
+to run routinely.
+
+### Week 3 status
+
+The chaos suite is green across every meaningful kill point in the
+canonical run, including the specific gap spec calls out as the one
+worth understanding deeply. Still open for the week: `resume(run_id)` as
+a first-class `cli.py` entry point (the chaos runner script proves the
+mechanism works, but it's test infrastructure, not the public CLI), and
+a real mechanism for `ToolCallCompleted.recovered` (still hardcoded
+`False` — every chaos test above proves resume works correctly without
+ever needing to *report* whether recovery happened, which is exactly the
+point, but the field itself still isn't populated honestly).

@@ -9,7 +9,7 @@ from durable_agents.llm.protocol import LLMResponse
 from durable_agents.llm.scripted import ScriptedLLM
 from durable_agents.orchestrator import Orchestrator
 from durable_agents.storage.protocol import ConcurrencyConflict, EventStore
-from durable_agents.tools.refund_tools import check_refund_policy, issue_refund, lookup_order
+from durable_agents.tools.refund_tools import InMemoryRefundBackend, build_refund_tools
 from durable_agents.tools.registry import Tool
 
 
@@ -72,7 +72,7 @@ def _llm_response(**overrides: object) -> LLMResponse:
 
 
 def _tools() -> dict[str, Tool]:
-    return {t.name: t for t in [lookup_order, check_refund_policy, issue_refund]}
+    return {t.name: t for t in build_refund_tools(InMemoryRefundBackend())}
 
 
 @pytest.mark.asyncio

@@ -17,17 +17,25 @@ class Tool:
     side_effect: bool
     requires_approval: Callable[[dict[str, Any]], bool]
     func: Callable[..., Awaitable[Any]]
+    needs_idempotency_key: bool
 
     async def execute(self, **kwargs: Any) -> Any:
         return await self.func(**kwargs)
 
 
 def _build_parameters_schema(func: Callable[..., Awaitable[Any]]) -> dict[str, Any]:
-    """Auto-derive a JSON schema for func's parameters from its type hints."""
+    """Auto-derive a JSON schema for func's parameters from its type hints.
+
+    Excludes a parameter literally named idempotency_key: that value is
+    computed and injected by the orchestrator, never something the model
+    should see as a field to fill in or invent.
+    """
 
     signature = inspect.signature(func)
     fields: dict[str, Any] = {}
     for name, param in signature.parameters.items():
+        if name == "idempotency_key":
+            continue
         annotation = param.annotation if param.annotation is not inspect.Parameter.empty else Any
         default = param.default if param.default is not inspect.Parameter.empty else ...
         fields[name] = (annotation, default)
@@ -58,6 +66,7 @@ def tool(
         approval_check = requires_approval
 
     def decorator(func: Callable[..., Awaitable[Any]]) -> Tool:
+        needs_idempotency_key = "idempotency_key" in inspect.signature(func).parameters
         return Tool(
             name=func.__name__,
             description=inspect.getdoc(func) or "",
@@ -65,6 +74,7 @@ def tool(
             side_effect=side_effect,
             requires_approval=approval_check,
             func=func,
+            needs_idempotency_key=needs_idempotency_key,
         )
 
     return decorator

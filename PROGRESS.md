@@ -157,11 +157,54 @@
 
 **Week 2 is now fully complete.**
 
-## Next — Week 3: Crash and resume ("the week that matters")
+## Week 3, Day 1 — real idempotency dedup + injectable ledger backend
 
-- In-flight reconciliation is already built (Week 2's orchestrator design
-  handles it structurally) — next: real idempotency dedup (the
-  already-completed check before executing a tool), fake tool APIs with
-  attempt ledgers (`FakeRefundAPI`-style, tracking `.attempts`/`.refunds`
-  separately from the event log), and the chaos test suite (SIGKILL at
-  every seq, assert exactly-once).
+- `tools/registry.py`: `_build_parameters_schema` excludes a parameter
+  named `idempotency_key` from the LLM-facing schema; `Tool` gained
+  `needs_idempotency_key: bool`, auto-detected from the function
+  signature. `orchestrator.py`'s `_reconcile()` now injects the real key
+  when needed and reads `dedup_hit` back to set
+  `ToolCallCompleted.provider_dedup_hit` correctly (previously hardcoded
+  `False`).
+- `tools/refund_tools.py` rewritten: `RefundBackend` Protocol,
+  `InMemoryRefundBackend` (the only backend this project has — tracks
+  `.attempts`/`.refunds` ledgers), `build_refund_tools(backend)` factory
+  replacing the old hardcoded module-level tools.
+- `tests/unit/test_refund_tools.py` (4 new tests) — the headline one
+  proves the project's central assertion directly:
+  `len(backend.attempts) == 2` but `len(backend.refunds) == 1` after
+  issuing the same idempotency key twice.
+- Full regression: `mypy --strict` clean across 29 files, 20/20 tests
+  passing. Full detail: `docs/BUILD_LOG.md` iteration 9.
+
+## Week 3, Day 1 (continued) — the chaos test suite: real SIGKILL, proven exactly-once
+
+- Verified Windows has no `SIGKILL` before relying on a fallback: `os.kill()`
+  there calls `TerminateProcess` for anything but Ctrl+C/Break — confirmed
+  genuinely abrupt (code after the kill line never runs), just not named
+  `SIGKILL`.
+- `orchestrator.py`: two kill hooks (`kill_after_seq`,
+  `kill_after_tool_execution_seq`) — the first tests "resume calls a
+  never-yet-called tool exactly once," the second targets spec's actual
+  "nastiest bug" (side effect already ran, nothing recorded it yet) since
+  no event seq identifies that gap on its own.
+- `tests/chaos/scenario_runner.py`: standalone subprocess entry point.
+  Two real bugs caught while building it: `ScriptedLLM` needs to be
+  sliced to the count of existing `LLMCallCompleted` events on resume
+  (a fresh instance otherwise replays from the start); `kill_after_seq=0`
+  originally had no code path that could fire, since `RunStarted` is
+  appended before the `Orchestrator` (and its kill hook) exists.
+- `tests/chaos/test_chaos.py`: 16 tests (15 kill points + the dedicated
+  nastiest-bug case), all real subprocesses and real Postgres. All pass.
+  The dedup mechanism was proven engaging via `dedup_hit: True` in the
+  actual resumed trace, not just via a matching count.
+- Full regression: `mypy --strict` clean across 32 files, 36/36 tests
+  passing (~33s total). Full detail: `docs/BUILD_LOG.md` iteration 10.
+
+## Next — Week 3 wrap-up
+
+- `resume(run_id)` as a first-class `cli.py` command (currently only the
+  test-only chaos runner script exercises resumability).
+- A real mechanism for `ToolCallCompleted.recovered` (still hardcoded
+  `False` — resume works correctly regardless, but the field itself
+  isn't populated honestly).

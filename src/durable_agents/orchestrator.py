@@ -1,3 +1,5 @@
+import os
+import signal
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -6,6 +8,7 @@ from uuid import UUID
 
 from durable_agents.events import (
     ApprovalRequested,
+    Event,
     LLMCallCompleted,
     LLMCallRequested,
     RunCompleted,
@@ -92,20 +95,57 @@ class Orchestrator:
     - Approval can be REQUESTED and the run correctly parks, but nothing
       here can GRANT it and resume the approved tool call — that's Week 4
       (the FastAPI endpoints + the resume entry point).
-    - `recovered` is always False on ToolCallCompleted. Week 2 never
-      kills a process mid-run, so this is never exercised; Week 3's chaos
-      tests need a real mechanism to detect genuine recovery.
-    - No idempotency dedup check before executing a tool, and
-      tools/refund_tools.py's issue_refund doesn't accept an
-      idempotency_key at all yet — a real crash-and-resume against it
-      today would double-execute with no protection. Deliberate,
-      temporary: Week 3 is explicitly where this gets built.
+    - `recovered` is always False on ToolCallCompleted. No process is
+      ever actually killed mid-run yet, so genuine recovery is never
+      exercised — chaos tests need a real mechanism to detect it (this
+      loop can't structurally tell "same process, moments ago" from
+      "different process, minutes ago," which is correct for safety but
+      means it can't self-report which one happened).
     """
 
-    def __init__(self, store: EventStore, llm: LLMClient, tools: dict[str, Tool]) -> None:
+    def __init__(
+        self,
+        store: EventStore,
+        llm: LLMClient,
+        tools: dict[str, Tool],
+        kill_after_seq: int | None = None,
+        kill_after_tool_execution_seq: int | None = None,
+    ) -> None:
         self._store = store
         self._llm = llm
         self._tools = tools
+        # Chaos-testing hooks only — both None in every normal path, since
+        # nothing sets them unless a test explicitly asks for a kill point.
+        # Passed explicitly rather than read from an env var here, to keep
+        # this class itself unaware of any particular env var name (the
+        # chaos test's own runner script owns that lookup).
+        #
+        # Two separate hooks, not one, because they test genuinely
+        # different gaps: kill_after_seq fires right after an event is
+        # durably recorded (e.g. right after ToolCallRequested — the tool
+        # was never actually called yet, so a resumed reconcile calls it
+        # exactly once). kill_after_tool_execution_seq fires right after
+        # a tool's side effect actually ran but before its Completed is
+        # recorded — the side effect already happened once; a resumed
+        # reconcile calls the tool again, and only the idempotency key
+        # stops that from becoming a second real refund. There is no
+        # event seq that identifies that second moment on its own, since
+        # it happens inside one reconcile() call between two appends.
+        self._kill_after_seq = kill_after_seq
+        self._kill_after_tool_execution_seq = kill_after_tool_execution_seq
+
+    def _maybe_chaos_kill(self) -> None:
+        # SIGKILL doesn't exist on Windows. os.kill() there calls
+        # TerminateProcess for anything except Ctrl+C/Ctrl+Break — a
+        # genuinely abrupt kill (verified: no code after this line runs),
+        # just not literally named SIGKILL on this platform.
+        kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
+        os.kill(os.getpid(), kill_signal)
+
+    async def _append(self, run_id: UUID, seq: int, event: Event) -> None:
+        await self._store.append(run_id, seq, event)
+        if self._kill_after_seq is not None and seq == self._kill_after_seq:
+            self._maybe_chaos_kill()
 
     async def run(self, run_id: UUID) -> RunState:
         while True:
@@ -118,7 +158,7 @@ class Orchestrator:
                 return state
 
             if state.max_steps is not None and state.step >= state.max_steps:
-                await self._store.append(
+                await self._append(
                     run_id,
                     next_seq,
                     RunFailed(
@@ -128,7 +168,7 @@ class Orchestrator:
                 continue
 
             if state.max_cost_usd is not None and state.total_cost_usd >= state.max_cost_usd:
-                await self._store.append(
+                await self._append(
                     run_id,
                     next_seq,
                     RunFailed(
@@ -144,7 +184,7 @@ class Orchestrator:
             decision = decide_next_action(state)
             match decision:
                 case CallLLM():
-                    await self._store.append(
+                    await self._append(
                         run_id,
                         next_seq,
                         LLMCallRequested(
@@ -158,7 +198,7 @@ class Orchestrator:
                 case ExecuteTool(tool_call=tool_call):
                     await self._request_tool_call(run_id, next_seq, now, state, tool_call)
                 case Finish(final_answer=final_answer):
-                    await self._store.append(
+                    await self._append(
                         run_id,
                         next_seq,
                         RunCompleted(
@@ -183,7 +223,7 @@ class Orchestrator:
     ) -> None:
         tool_obj = self._tools.get(tool_call.name)
         if tool_obj is None:
-            await self._store.append(
+            await self._append(
                 run_id,
                 next_seq,
                 ToolCallFailed(
@@ -200,7 +240,7 @@ class Orchestrator:
             return
 
         if tool_obj.requires_approval(tool_call.arguments):
-            await self._store.append(
+            await self._append(
                 run_id,
                 next_seq,
                 ApprovalRequested(
@@ -215,7 +255,7 @@ class Orchestrator:
             return
 
         key = idempotency_key(run_id, next_seq, tool_call.name, tool_call.arguments)
-        await self._store.append(
+        await self._append(
             run_id,
             next_seq,
             ToolCallRequested(
@@ -237,7 +277,7 @@ class Orchestrator:
 
         if op.kind == "llm":
             response = await self._llm.call(state.messages, _tool_schemas(self._tools))
-            await self._store.append(
+            await self._append(
                 run_id,
                 next_seq,
                 LLMCallCompleted(
@@ -257,10 +297,22 @@ class Orchestrator:
         else:
             assert op.tool is not None and op.arguments is not None
             tool_obj = self._tools[op.tool]
+            kwargs = dict(op.arguments)
+            if tool_obj.needs_idempotency_key:
+                kwargs["idempotency_key"] = op.idempotency_key
             start = time.monotonic()
-            result = await tool_obj.execute(**op.arguments)
+            result = await tool_obj.execute(**kwargs)
             duration_ms = int((time.monotonic() - start) * 1000)
-            await self._store.append(
+            if (
+                self._kill_after_tool_execution_seq is not None
+                and next_seq == self._kill_after_tool_execution_seq
+            ):
+                # The side effect above already happened. Killing here,
+                # before its Completed is recorded, is the exact gap
+                # only the idempotency key protects against.
+                self._maybe_chaos_kill()
+            provider_dedup_hit = bool(result.get("dedup_hit")) if isinstance(result, dict) else False
+            await self._append(
                 run_id,
                 next_seq,
                 ToolCallCompleted(
@@ -272,6 +324,6 @@ class Orchestrator:
                     result=result,
                     duration_ms=duration_ms,
                     recovered=False,
-                    provider_dedup_hit=False,
+                    provider_dedup_hit=provider_dedup_hit,
                 ),
             )
