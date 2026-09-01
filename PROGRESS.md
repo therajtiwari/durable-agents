@@ -271,3 +271,91 @@ Two of spec's five Week 4 items are already done (from Week 2):
 
 Planned order: (1)+(2) together, then FastAPI, then the concurrency fix
 + test.
+
+## Week 4, Day 1 — approval grant/denial now actually resume the run
+
+- Bug found before fixing: `ApprovalGranted`/`ApprovalDenied` cleared
+  `pending_approval` but touched nothing else, so `decide_next_action`
+  kept re-deciding the same tool call, which kept re-triggering
+  `requires_approval()` — grant and denial were both silent no-ops.
+- Denial fix: `state.py`'s `ApprovalDenied` case appends a `tool`-role
+  message with the reason (same shape as the `ToolCallFailed` fix) —
+  breaks the loop by changing `last.role`, no new field needed.
+- Grant fix: new `RunState.approved_step: int | None`, set on
+  `ApprovalGranted`, checked (and cleared) in the orchestrator's
+  `requires_approval()` gate. Chosen over having the orchestrator rescan
+  the event log — keeps the "state carries what's needed" discipline
+  intact.
+- Two new unit tests, both written and confirmed red before the fix:
+  grant resumes the exact call exactly once (no double approval, no
+  double execution); denial feeds the reason back and the tool never
+  executes.
+- Full regression: `mypy --strict` clean (29 files), 18/18 unit tests,
+  16/16 chaos tests. Full detail: `docs/BUILD_LOG.md` iteration 13.
+
+**Next: item 3 — FastAPI approve/deny/status endpoints.** Nothing calls
+`store.append(ApprovalGranted/...)` yet except tests, by hand.
+
+## Week 4, Day 2 — FastAPI approve/deny/status endpoints
+
+- Flagged a real conflict first: `CLAUDE.md`'s "only the orchestrator
+  appends events" didn't anticipate an HTTP endpoint recording a human
+  decision. Resolved by narrowing the invariant's wording (in
+  `CLAUDE.md` itself) rather than adding a pass-through orchestrator
+  method just to satisfy the old wording literally.
+- `src/durable_agents/api/app.py`: `create_app(store) -> FastAPI`.
+  `GET /runs/{id}` (status), `POST /runs/{id}/approve`,
+  `POST /runs/{id}/deny` — all append-only against the `EventStore`
+  directly, no `Orchestrator` involved. 409 if the run isn't
+  `awaiting_approval`, or on a `ConcurrencyConflict` race.
+- New dependencies (asked first): `fastapi` (runtime), `httpx`
+  (dev-only, for FastAPI's `TestClient`).
+- 5 new tests in `tests/unit/test_api.py` — HTTP layer only; the
+  approve/deny state-transition logic itself was already proven in
+  Iteration 13's orchestrator tests.
+- Full regression: `mypy --strict` clean (30 files), 23/23 unit tests,
+  16/16 chaos untouched. Full detail: `docs/BUILD_LOG.md` iteration 14.
+
+**Next: item 4 — two-worker concurrency test.** Needs `orchestrator.py`
+fixed first: its main loop doesn't currently handle `ConcurrencyConflict`
+at all — a racing worker's `_append()` would raise and crash `run()`
+rather than back off and re-read.
+
+## Week 4, Day 2 (continued) — ConcurrencyConflict handling + two-worker test
+
+- `orchestrator.py`: `_append()` now catches `ConcurrencyConflict` and
+  returns; no other code changed, since `run()`'s main loop already
+  re-reads events fresh at the top of every iteration regardless of
+  what happened in the previous one.
+- `tests/integration/test_concurrent_workers.py`: two `Orchestrator`s,
+  each with its own real `asyncpg` pool against the same Postgres
+  container, raced via `asyncio.gather` on one run. Deliberately not
+  built on the in-memory fake (its calls do no real I/O, so two
+  gathered coroutines never actually interleave — no genuine race).
+  Confirms: both workers converge to `completed` with the same answer,
+  and a `GROUP BY type` count on the real `events` table shows exactly
+  one row of each event type despite the race. Ran 5x to rule out
+  flakiness — stable every time.
+- Full regression: `mypy --strict` clean (35 files), 44/44 tests
+  (23 unit, 5 integration, 16 chaos). Full detail: `docs/BUILD_LOG.md`
+  iteration 15.
+
+**Week 4 is now fully complete.**
+
+## Next — Week 5: Guardrails
+
+Per spec section 18:
+- Threat model written down first, before any code
+- L1 input scan: patterns, PII detection and redaction
+- L2 tool-result scan and delimiting — spec calls this "the layer that
+  matters"
+- L3 output validation: schema, allowlist, policy bounds
+- L4 run-level: loop detection, escalation
+- `GuardrailTriggered` events throughout (event + `state.py` handling
+  already exist, from Week 1/2 — this week is the actual detection logic)
+- Attack corpus (50-100 labelled) + benign corpus
+- Measure attack success rate **and** false positive rate
+
+`guardrails/decisions.py` is the user's last untouched write-yourself
+file. Done when there are before/after numbers for both metrics and the
+PII-ordering test passes.

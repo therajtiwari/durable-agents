@@ -16,9 +16,15 @@ picking one.
 - **`rebuild_state()` must stay pure.** No I/O, no wall-clock reads, no
   randomness, no network calls. Same events in, same state out, every time.
   If a change to this function needs any of those, the change is wrong.
-- **Only the orchestrator appends events.** Leaf components (LLM client,
-  tools, guardrails) do work and return results — they never touch the event
-  store directly. This is what keeps them independently testable.
+- **Leaf components never append events.** LLM client, tools, guardrails
+  do work and return results — they never touch the event store directly.
+  This is what keeps them independently testable. This does not cover
+  every possible caller: an external human decision (approve/deny via the
+  API) is a fact injected from outside the run, not agent-loop work being
+  faked past the orchestrator, so the API layer may append
+  `ApprovalGranted`/`ApprovalDenied` directly. Actually resuming a run
+  after such an event (calling `orchestrator.run()` again) stays a
+  separate concern from recording the decision.
 - **Event names are past tense.** `ToolCallCompleted`, never
   `CompleteToolCall`. Events are facts about what already happened, not
   commands.

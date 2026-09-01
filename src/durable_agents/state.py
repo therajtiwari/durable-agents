@@ -96,6 +96,7 @@ class RunState:
     total_tokens: int = 0
     total_cost_usd: Decimal = Decimal("0")
     pending_approval: PendingApproval | None = None
+    approved_step: int | None = None
     guardrail_hits: list[GuardrailHit] = field(default_factory=list)
     max_steps: int | None = None
     max_cost_usd: Decimal | None = None
@@ -154,6 +155,9 @@ def apply(state: RunState, event: Event) -> RunState:
                     arguments=event.arguments,
                     idempotency_key=event.idempotency_key,
                 ),
+                # Consumes any pending approval grant for this step — it's
+                # done its one job of letting this exact request through.
+                approved_step=None,
             )
 
         case ToolCallCompleted():
@@ -209,10 +213,36 @@ def apply(state: RunState, event: Event) -> RunState:
             )
 
         case ApprovalGranted():
-            return replace(state, status="running", pending_approval=None)
+            # decide_next_action will produce the exact same ExecuteTool
+            # decision it produced before the approval was requested (the
+            # assistant message that carried this tool call never
+            # changed). approved_step marks that one instance as cleared
+            # so the orchestrator skips requires_approval() for it,
+            # rather than parking on ApprovalRequested a second time.
+            approved_step = state.pending_approval.step if state.pending_approval else None
+            return replace(
+                state, status="running", pending_approval=None, approved_step=approved_step
+            )
 
         case ApprovalDenied():
-            return replace(state, status="running", pending_approval=None)
+            # Same shape as the ToolCallFailed fix: without a message here,
+            # the last message is still the assistant's tool_calls, so
+            # decide_next_action would retry the identical call and hit
+            # requires_approval() again — parking forever. Feeding the
+            # denial back as a tool-role message makes the model react
+            # instead.
+            tool_name = state.pending_approval.tool if state.pending_approval else None
+            message = Message(
+                role="tool",
+                content=f"Error: approval denied: {event.reason}",
+                tool_name=tool_name,
+            )
+            return replace(
+                state,
+                status="running",
+                pending_approval=None,
+                messages=[*state.messages, message],
+            )
 
         case RunCompleted():
             return replace(

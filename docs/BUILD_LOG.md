@@ -1184,3 +1184,243 @@ entry point, a fake tool API with attempt ledgers persisted across real
 process restarts, the chaos test suite across every meaningful kill
 point, and now genuine `recovered` reporting. `guardrails/decisions.py`
 remains the user's last untouched write-yourself file — Week 5 scope.
+
+---
+
+## Iteration 13 — approval grant/denial actually resume the run (Week 4, item 1+2)
+
+### The bug: granting an approval did nothing useful
+
+`ApprovalGranted` and `ApprovalDenied` both only cleared
+`pending_approval` and set `status` back to `"running"`. Neither touched
+`state.messages`. Since `decide_next_action()` decides purely from
+`state.messages[-1]` — still the same assistant message with the same
+`tool_calls`, untouched by any approval event — the very next loop
+iteration would reach `_request_tool_call` for the *identical* call,
+re-evaluate `tool_obj.requires_approval(args)` fresh, get `True` again,
+and append a second `ApprovalRequested`. Both grant and denial were
+indistinguishable from a no-op: parking forever, one `ApprovalRequested`
+at a time, never actually unblocking or informing the model. Found by
+reasoning through the code, then confirmed with two new unit tests
+before any fix existed (both failed as predicted, red before green).
+
+### Denial fix: same shape as the `ToolCallFailed` bug from Week 2
+
+No new state needed. `state.py`'s `ApprovalDenied` case now reads
+`state.pending_approval.tool` (before clearing it) and appends a
+`role="tool"` message: `f"Error: approval denied: {event.reason}"`. Next
+iteration, `decide_next_action` sees `last.role == "tool"` instead of
+`"assistant"` and returns `CallLLM()` — the model gets to react to the
+denial as a fact, exactly like a failed tool call, instead of the
+orchestrator silently retrying the same rejected call.
+
+### Grant fix: needed one real design decision
+
+Denial breaks the loop just by changing `last.role`. Granting can't do
+that the same way — the call must actually *execute* this time, not
+just get re-described to the model. Two designs considered:
+
+- **Chosen: `RunState.approved_step: int | None`.** `ApprovalGranted`
+  sets it to `state.pending_approval.step` before clearing
+  `pending_approval`. `_request_tool_call` skips the
+  `requires_approval()` re-check when `state.approved_step ==
+  state.step`. `ToolCallRequested`'s own case clears it back to `None`
+  once consumed — mirrors how `in_flight` and `pending_approval`
+  themselves are cleared exactly when their job is done. Safe because
+  only one approval can ever be pending at a time (the run is fully
+  parked while `awaiting_approval`), so step equality alone
+  unambiguously identifies "this exact request."
+- **Rejected: orchestrator rescans the event log.** After
+  `ApprovalGranted`, walk events backward for the `ApprovalRequested` it
+  resolves, pull tool+args from there, append `ToolCallRequested`
+  directly — bypassing `decide_next_action` and `requires_approval`
+  entirely for that path. Avoids a new `RunState` field, but makes the
+  orchestrator do its own event-log detective work instead of trusting
+  state, breaking the fold-once discipline every other piece of this
+  project has kept (`state.py` derives facts from events exactly once;
+  nothing else re-derives them). User picked the state-field approach
+  for this reason.
+
+### Two new tests, both red-then-green
+
+`tests/unit/test_orchestrator.py`:
+- `test_approval_granted_resumes_the_same_call_exactly_once` — parks on
+  approval, hand-appends `ApprovalGranted`, resumes with a *fresh*
+  `Orchestrator` + fresh `ScriptedLLM` (mirrors a real separate resume
+  process). Asserts the run completes and that `ApprovalRequested`,
+  `ToolCallRequested`, and `ToolCallCompleted` each appear **exactly
+  once** — proving the grant didn't cause a second approval cycle or a
+  second tool execution.
+- `test_approval_denied_feeds_reason_back_instead_of_looping` — same
+  setup, hand-appends `ApprovalDenied` instead. Asserts the run
+  completes, the model was called exactly once more, a `tool`-role
+  message containing the denial reason exists in final state, and
+  `ToolCallRequested` **never** appears — the denied call must not
+  execute at all.
+
+**Full regression:** `mypy --strict` clean across 29 source files
+(src + tests/unit), 18/18 unit tests passing (2 new), all 16 chaos tests
+still green (confirms the new `approved_step` field doesn't disturb
+crash/resume behavior for calls that never needed approval).
+
+### Not yet done
+
+Nothing currently calls `store.append(ApprovalGranted/...)` except the
+tests themselves, by hand. That's item 3, next: FastAPI approve/deny/
+status endpoints.
+
+---
+
+## Iteration 14 — FastAPI approve/deny/status endpoints (Week 4, item 3)
+
+### A real invariant conflict, flagged and resolved before writing code
+
+`CLAUDE.md`'s invariant said "only the orchestrator appends events,"
+written to stop LLM/tool/guardrail leaf components from faking outcomes
+past the orchestrator. It didn't anticipate a fourth kind of caller: an
+HTTP endpoint recording a human's decision. Two options were weighed —
+narrow the invariant's wording to what it actually protects against, or
+add a pass-through `Orchestrator.record_approval()` method that does
+nothing but satisfy the letter of the old wording. Chose narrowing:
+`CLAUDE.md` now says "leaf components never append events" and states
+explicitly that `ApprovalGranted`/`ApprovalDenied` are facts injected
+from outside the run, not agent-loop work — the API layer may append
+them directly. Actually resuming the run (`orchestrator.run()` again)
+stays a separate concern, deferred to whatever picks up parked runs
+(a worker/sweeper — Week 6 territory, per spec's own three-process
+architecture).
+
+### Endpoints: append-only, no orchestrator involved
+
+`src/durable_agents/api/app.py`, `create_app(store: EventStore) -> FastAPI`
+(store injected, mirrors `PostgresEventStore`'s own injection pattern):
+
+- `GET /runs/{run_id}` — `rebuild_state(await store.read(run_id))`,
+  404 if no events exist yet. Returns a `RunStatusResponse`: status,
+  step, tokens, cost, `pending_approval` (tool/arguments/reason) if
+  parked, `final_answer`/`failure_reason` if finished. Deliberately
+  excludes the full message list — that's what `replay` is for.
+- `POST /runs/{run_id}/approve` — body `{approver}`. 409 if
+  `state.status != "awaiting_approval"` (nothing to approve). Appends
+  `ApprovalGranted` at `expected_seq = len(events)`; a `ConcurrencyConflict`
+  from the store (someone else acted on this run between the read and
+  the append) surfaces as 409, not a crash.
+- `POST /runs/{run_id}/deny` — same shape, body `{approver, reason}`,
+  appends `ApprovalDenied`.
+
+Both mutating endpoints return `204 No Content` — the caller re-`GET`s
+status if they want the new state, rather than the endpoint re-deriving
+it from a second read it doesn't otherwise need.
+
+### Two new dependencies, asked about first
+
+`fastapi` (runtime) and `httpx` (dev-only, required by FastAPI's own
+`TestClient` for in-process request testing — no lighter alternative
+exists for testing a FastAPI app without a real running server).
+
+### Tests: HTTP layer only, state logic already proven elsewhere
+
+`tests/unit/test_api.py`, 5 tests, using the same `InMemoryEventStore`
+fake pattern as `test_orchestrator.py` plus FastAPI's `TestClient`.
+Deliberately hand-builds a parked-on-`ApprovalRequested` event sequence
+rather than running an `Orchestrator` — these tests are about routing,
+status codes, and request/response shapes, not whether granting an
+approval resumes a run correctly (that's `test_orchestrator.py`'s job,
+already covered in Iteration 13). Covers: 404 on an unknown run, status
+correctly reports `awaiting_approval` with pending-approval detail,
+approve and deny both clear it, approving a run that isn't awaiting
+approval returns 409.
+
+**Full regression:** `mypy --strict` clean across 30 source files
+(src + tests/unit), 23/23 unit tests passing (5 new), all 16 chaos
+tests untouched by this change (no orchestrator/state code was modified).
+
+### Not yet done
+
+Item 4, next: two-worker concurrency test — needs `orchestrator.py`
+fixed first to actually handle `ConcurrencyConflict` in its main loop
+(currently unhandled — a racing worker's `_append()` would raise and
+crash `run()` rather than back off and re-read).
+
+---
+
+## Iteration 15 — ConcurrencyConflict handling + two-worker test, Week 4 fully complete
+
+### The fix: swallow the conflict, let the loop's existing structure do the rest
+
+`Orchestrator._append()` now wraps `self._store.append(...)` in a
+`try/except ConcurrencyConflict: return`. No other code changed. Every
+call site in `run()`'s main loop already falls straight through to the
+top of the `while True` on every path — whether or not the append it
+just awaited actually happened — since the loop always re-reads events
+and rebuilds state fresh at the top of each iteration anyway (the same
+"no hidden memory" property the whole orchestrator was already built
+around). So a worker that loses a seq race just wastes one read+decide;
+the winner's event is already durably there by the time it re-reads.
+Considered adding a small randomized sleep before retrying to reduce
+busy-spinning under sustained contention, but rejected it as speculative
+— nothing yet demonstrated it was needed, and single-run contention
+between two workers converges in at most a few rounds regardless.
+
+Also removed stale docstring text on `Orchestrator` claiming "nothing
+here can GRANT [an approval] and resume the approved tool call" — false
+since Iteration 13.
+
+### The test: real Postgres, two independent connection pools, genuine race
+
+`tests/integration/test_concurrent_workers.py`,
+`test_two_workers_racing_on_one_run_converge_without_crashing`. Two
+`Orchestrator` instances, each with its **own** `asyncpg` pool (both
+pointed at the same Postgres container) and its own `ScriptedLLM`,
+raced via `asyncio.gather` on one `run_id` with a trivial one-LLM-call
+scenario (no tools — the point is proving the event-append race itself,
+not exercising tool idempotency, already covered by Week 3's chaos
+suite).
+
+Deliberately **not** built on the in-memory fake store used everywhere
+else in the unit tests: that fake's `append`/`read` do no real I/O, so
+two `asyncio`-gathered coroutines calling it never actually interleave
+— CPython runs an `await` on a coroutine that itself never suspends
+without yielding back to the event loop at all. A real race needs a
+real thing to race over; `asyncpg` talking to an actual Postgres socket
+provides that, an in-memory dict does not. This is the same reasoning
+that put the chaos suite on real subprocesses instead of a mocked
+clock/signal — this project doesn't fake the assumption it's actually
+trying to prove.
+
+Traced through by hand before writing the test, to know what to assert:
+both workers read the same `RunStarted`-only state, both attempt
+`LLMCallRequested` at seq 1 — one wins, one's `ConcurrencyConflict` is
+swallowed. Both then see the same dangling op and both attempt to
+reconcile it (a real duplicate `ScriptedLLM.call()`, wasted on the
+loser — consistent with the project's existing known limitation that
+LLM calls, unlike tool calls, have no idempotency guard), racing again
+for `LLMCallCompleted` at seq 2. Once that lands, whichever worker's
+next read sees `status == "completed"` returns immediately — the status
+check is the very first thing checked each loop iteration, before
+`in_flight` or `decide_next_action` — so no worker ever calls its
+`ScriptedLLM` more than once. Verified this by giving each worker only
+a **single** scripted response and confirming no `IndexError`.
+
+Assertions: both workers' returned `RunState`s report `completed` with
+the same `final_answer`; a `GROUP BY type` count query against the real
+`events` table confirms exactly one row of each of `RunStarted`,
+`LLMCallRequested`, `LLMCallCompleted`, `RunCompleted` — despite two
+workers racing on every single step, the `(run_id, seq)` primary key
+made duplication structurally impossible, and the new `_append()`
+handling meant the loser backed off instead of crashing. Ran the test
+5 times in a row to check for flakiness from the race's inherent
+timing sensitivity — passed every time.
+
+**Full regression:** `mypy --strict` clean across 35 source files
+(src + all tests), 44/44 tests passing (23 unit, 5 integration including
+the new one, 16 chaos).
+
+### Week 4 — fully complete
+
+All five of spec section 18's Week 4 items now exist and are verified:
+`requires_approval` and park-and-exit (Week 2), resuming after grant and
+the denial path (Iteration 13), FastAPI approve/deny/status (Iteration
+14), and now the two-worker concurrency test with genuine
+`ConcurrencyConflict` handling. `guardrails/decisions.py` remains the
+user's last untouched write-yourself file — Week 5 scope, next.

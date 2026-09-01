@@ -4,7 +4,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from durable_agents.events import Event, RunStarted, ToolCallInvocation
+from durable_agents.events import ApprovalDenied, ApprovalGranted, Event, RunStarted, ToolCallInvocation
 from durable_agents.llm.protocol import LLMResponse
 from durable_agents.llm.scripted import ScriptedLLM
 from durable_agents.orchestrator import Orchestrator
@@ -145,6 +145,97 @@ async def test_approval_required_parks_without_looping() -> None:
 
     events = await store.read(run_id)
     assert [type(e).__name__ for e in events[1:]] == ["LLMCallRequested", "LLMCallCompleted", "ApprovalRequested"]
+
+
+@pytest.mark.asyncio
+async def test_approval_granted_resumes_the_same_call_exactly_once() -> None:
+    store = InMemoryEventStore()
+    run_id = uuid4()
+    await store.append(run_id, 0, _run_started())
+
+    args = {"order_id": "A-8891", "amount_inr": 6400, "reason": "damaged"}
+    llm = ScriptedLLM(
+        [
+            _llm_response(
+                content="Issuing the refund.",
+                tool_calls=[ToolCallInvocation(id="t1", name="issue_refund", arguments=args)],
+                stop_reason="tool_use",
+            ),
+        ]
+    )
+    orchestrator = Orchestrator(store=store, llm=llm, tools=_tools())
+    parked = await orchestrator.run(run_id)
+    assert parked.status == "awaiting_approval"
+
+    events = await store.read(run_id)
+    await store.append(
+        run_id, len(events), ApprovalGranted(seq=len(events), created_at=_now(), approver="mgr")
+    )
+
+    # A resumed process gets a fresh Orchestrator and a fresh LLM client —
+    # only the response for the call still ahead of it, mirroring how
+    # ScriptedLLM is sliced to already-completed calls in the chaos suite.
+    resumed_llm = ScriptedLLM([_llm_response(content="Refund processed.", stop_reason="end_turn")])
+    resumed = Orchestrator(store=store, llm=resumed_llm, tools=_tools())
+    state = await resumed.run(run_id)
+
+    assert state.status == "completed"
+    assert state.final_answer == "Refund processed."
+
+    event_types = [type(e).__name__ for e in await store.read(run_id)]
+    # Exactly one ToolCallRequested/Completed pair for issue_refund: the
+    # grant must not have triggered a second ApprovalRequested, nor a
+    # second attempt at the tool call.
+    assert event_types.count("ApprovalRequested") == 1
+    assert event_types.count("ToolCallRequested") == 1
+    assert event_types.count("ToolCallCompleted") == 1
+
+
+@pytest.mark.asyncio
+async def test_approval_denied_feeds_reason_back_instead_of_looping() -> None:
+    store = InMemoryEventStore()
+    run_id = uuid4()
+    await store.append(run_id, 0, _run_started())
+
+    args = {"order_id": "A-8891", "amount_inr": 6400, "reason": "damaged"}
+    llm = ScriptedLLM(
+        [
+            _llm_response(
+                content="Issuing the refund.",
+                tool_calls=[ToolCallInvocation(id="t1", name="issue_refund", arguments=args)],
+                stop_reason="tool_use",
+            ),
+        ]
+    )
+    orchestrator = Orchestrator(store=store, llm=llm, tools=_tools())
+    parked = await orchestrator.run(run_id)
+    assert parked.status == "awaiting_approval"
+
+    events = await store.read(run_id)
+    await store.append(
+        run_id,
+        len(events),
+        ApprovalDenied(
+            seq=len(events), created_at=_now(), approver="mgr", reason="refund too large"
+        ),
+    )
+
+    resumed_llm = ScriptedLLM(
+        [_llm_response(content="Understood, not issuing the refund.", stop_reason="end_turn")]
+    )
+    resumed = Orchestrator(store=store, llm=resumed_llm, tools=_tools())
+    state = await resumed.run(run_id)
+
+    assert state.status == "completed"
+    assert resumed_llm.call_count == 1
+    assert any(
+        m.role == "tool" and m.content is not None and "refund too large" in m.content
+        for m in state.messages
+    )
+
+    event_types = [type(e).__name__ for e in await store.read(run_id)]
+    assert "ToolCallRequested" not in event_types  # denied call must never actually execute
+    assert event_types.count("ApprovalRequested") == 1
 
 
 @pytest.mark.asyncio

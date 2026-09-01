@@ -11,6 +11,7 @@ requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2",
     "asyncpg",
+    "fastapi>=0.141.1",
 ]
 
 [dependency-groups]
@@ -20,6 +21,7 @@ dev = [
     "testcontainers[postgres]",
     "mypy",
     "asyncpg-stubs",
+    "httpx>=0.28.1",
 ]
 
 [tool.hatch.build.targets.wheel]

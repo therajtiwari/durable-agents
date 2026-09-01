@@ -20,7 +20,7 @@ from durable_agents.events import (
 )
 from durable_agents.llm.protocol import LLMClient
 from durable_agents.state import RunState, rebuild_state
-from durable_agents.storage.protocol import EventStore
+from durable_agents.storage.protocol import ConcurrencyConflict, EventStore
 from durable_agents.tools.registry import Tool, idempotency_key
 
 
@@ -90,11 +90,8 @@ class Orchestrator:
     died — rebuild_state can't tell the difference, and neither does this
     loop. It just finishes whatever's in flight.
 
-    Known Week 2 simplifications, not yet built:
+    Known simplification, not yet built:
     - No guardrails (Week 5) — nothing runs between decide and act yet.
-    - Approval can be REQUESTED and the run correctly parks, but nothing
-      here can GRANT it and resume the approved tool call — that's Week 4
-      (the FastAPI endpoints + the resume entry point).
     """
 
     def __init__(
@@ -146,7 +143,15 @@ class Orchestrator:
         os.kill(os.getpid(), kill_signal)
 
     async def _append(self, run_id: UUID, seq: int, event: Event) -> None:
-        await self._store.append(run_id, seq, event)
+        try:
+            await self._store.append(run_id, seq, event)
+        except ConcurrencyConflict:
+            # Another worker on the same run_id already claimed this seq.
+            # Whatever they appended is now the truth; every caller of
+            # _append falls straight through to the top of run()'s while
+            # loop regardless of what happens here, which re-reads events
+            # fresh and re-decides from there. Nothing else to do.
+            return
         if self._kill_after_seq is not None and seq == self._kill_after_seq:
             self._maybe_chaos_kill()
 
@@ -244,7 +249,8 @@ class Orchestrator:
             )
             return
 
-        if tool_obj.requires_approval(tool_call.arguments):
+        already_approved = state.approved_step == state.step
+        if not already_approved and tool_obj.requires_approval(tool_call.arguments):
             await self._append(
                 run_id,
                 next_seq,
