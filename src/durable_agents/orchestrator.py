@@ -80,8 +80,16 @@ def decide_next_action(state: RunState) -> Decision:
 
 
 def _tool_schemas(tools: dict[str, Tool]) -> list[dict[str, Any]]:
+    """A neutral shape (name, description, a plain JSON schema under
+    parameters) — not any one provider's wire format. Anthropic wants
+    input_schema, OpenAI wants this wrapped in {"type": "function",
+    "function": {...}}; translating that is each LLMClient
+    implementation's job, so this stays provider-agnostic rather than
+    baking one vendor's field name into the orchestrator itself.
+    """
+
     return [
-        {"name": t.name, "description": t.description, "input_schema": t.parameters}
+        {"name": t.name, "description": t.description, "parameters": t.parameters}
         for t in tools.values()
     ]
 

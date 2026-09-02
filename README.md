@@ -212,6 +212,27 @@ class MyClient(LLMClient):
 `ScriptedLLM` ships for tests — a fixed list of responses (or
 exceptions, to simulate a flaky provider) with no network and no cost.
 
+For a real model, `OpenAICompatibleClient` ships too (needs
+`pip install durable-agents[openai]`):
+
+```python
+from durable_agents.llm.openai_compatible import OpenAICompatibleClient
+
+llm = OpenAICompatibleClient(
+    base_url="https://api.openai.com/v1",   # or Ollama, vLLM, Groq, OpenRouter, Azure OpenAI...
+    model="gpt-4o-mini",
+    api_key=os.environ["OPENAI_API_KEY"],
+)
+```
+
+It's deliberately not vendor-specific: the OpenAI chat-completions wire
+format is what most providers — including most local/open-source model
+servers — actually speak, so one implementation covers far more ground
+than a client tied to one company's SDK. Point `base_url` at whichever
+server you use. Retries are the orchestrator's job (see Iteration 24 in
+`docs/BUILD_LOG.md`), so this client doesn't retry internally — it
+raises, and the runtime's own backoff takes it from there.
+
 ---
 
 ## Honest limits

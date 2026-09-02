@@ -644,15 +644,32 @@ cannot use. Every item here is a hard blocker:
 
 ---
 
-### Phase 2 — make it run a real agent (NEXT)
+### Phase 2 — make it run a real agent
 
-7. **`AnthropicClient`** (deferred twice — silently in Week 2, then
-   explicitly in Week 5). Until this exists the runtime can only replay
-   one fixed scripted scenario; it cannot be pointed at a real model.
-   Note the burden this puts on third-party implementers:
-   `LLMResponse` demands `cost_usd: Decimal` and `provider_request_id`,
-   which a custom provider may have to fabricate — worth revisiting
-   while writing the first real implementation.
+1. **Real provider client** ✅ DONE (Iteration 26) — **`OpenAICompatibleClient`**,
+   not `AnthropicClient`. User questioned the plan directly: "why only
+   AnthropicClient, shouldn't it be generic?" Right call — spec's
+   Component 5 names `AnthropicClient` literally, which would have
+   shipped one vendor's SDK format as the library's only real
+   implementation, the same bias shape already caught once in
+   guardrails' PII patterns. Built `llm/openai_compatible.py` against
+   the OpenAI chat-completions wire format instead — spoken by OpenAI,
+   Azure OpenAI, and most local/open-source servers (Ollama, vLLM,
+   Groq, Together, OpenRouter), so one implementation covers more real
+   usage than a vendor-specific wrapper. Also found and fixed a second
+   leak while building it: `orchestrator._tool_schemas()` had been
+   emitting Anthropic's own `input_schema` field name since Week 2,
+   hardcoded into the orchestrator itself — renamed to the neutral
+   `parameters`. Cost computed from configurable per-1k-token rates
+   (not a hardcoded, quickly-stale price table); no internal retry
+   (Orchestrator already owns that, per Iteration 24); ships as an
+   optional `openai` extra, not imported from the top-level package
+   (same pattern as the `api`/FastAPI extra). 6 new tests using
+   `httpx.MockTransport`. Full regression: `mypy --strict` clean (55
+   files), 114/114 tests, chaos re-verified 16/16. A dedicated
+   `AnthropicClient` remains buildable later against the same
+   `LLMClient` interface if wanted. Full detail: `docs/BUILD_LOG.md`
+   iteration 26.
 8. **Live-tests tier** — `@pytest.mark.live`, `skipif` without an API
    key so a fresh clone still runs green, hard cost cap, tools always
    fake, never in CI on every push.
@@ -660,7 +677,7 @@ cannot use. Every item here is a hard blocker:
    cannot *start* a run. Today that only works via CLI or direct Python
    calls, which makes the HTTP surface incomplete for any real
    deployment.
-10. **L1 classifier sub-layer** (unblocked once (7) lands) — the
+10. **L1 classifier sub-layer** (unblocked now that item 1 above is done) — the
     "is this text trying to manipulate an AI system?" check that
     pattern matching structurally cannot do. Optional, off by default,
     cached by input hash.

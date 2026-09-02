@@ -184,6 +184,55 @@ the field existed keep the hash they were stored with.
 
 ---
 
+## Provider client
+
+**`OpenAICompatibleClient`, not `AnthropicClient`.** Spec section 10
+names `AnthropicClient` as the reference implementation. Rejected:
+shipping one vendor-specific SDK wrapper as the library's only real
+client is the same shape of bias already caught and fixed in
+guardrails — a "universal" library defaulting to one company's format.
+The OpenAI chat-completions wire format is what most providers,
+including most local/open-source model servers (Ollama, vLLM, Groq,
+Together, OpenRouter, Azure OpenAI), actually speak — one
+implementation covers more real usage than a client tied to one SDK.
+`LLMClient` itself was always vendor-neutral (one abstract method); the
+narrowness was only ever in which concrete implementation got shipped.
+
+**`orchestrator._tool_schemas()`'s output was silently Anthropic-shaped**
+(`input_schema`, Anthropic's own field name) until this was caught while
+building the generic client. Renamed to the neutral `parameters` — the
+orchestrator now hands every `LLMClient` implementation a
+provider-agnostic shape, and translating that into a specific wire
+format (OpenAI wraps it in `{"type": "function", "function": {...}}`,
+Anthropic wants it flat under `input_schema`) is each client's own job,
+matching what `LLMClient.call()`'s docstring already claimed but the
+code didn't actually do.
+
+**Cost is computed from configurable per-1k-token rates, not a
+hardcoded price table.** Prices vary by model and change often;
+hardcoding one vendor's numbers into a generic client would go stale
+immediately and re-introduces the same bias problem in a different
+shape. Defaults to `$0` if you don't configure rates.
+
+**The client does not retry internally.** `Orchestrator` already
+retries a failed LLM call with backoff, reading the attempt budget from
+the event log (Iteration 24). A client-level retry would double the
+backoff for no benefit and duplicate logic that already exists at the
+layer meant to own it.
+
+**The OpenAI-shaped `tool_call_id` is recovered by pairing, not
+persisted.** OpenAI's format requires a tool-result message to carry
+the id of the assistant `tool_calls` entry it answers — but
+`durable_agents` events never store that id past the turn that produced
+it. Rather than add a field to `ToolCallRequested`/`ToolCallCompleted`
+(more write-yourself-file churn for a client-side formatting detail),
+the client pairs each tool-role message with the immediately preceding
+assistant message's `tool_calls[0].id` when building the request. Valid
+today because the orchestrator only ever acts on one tool call per
+step; would need revisiting if that ever changes.
+
+---
+
 ## Known open questions
 
 Recorded rather than quietly settled:

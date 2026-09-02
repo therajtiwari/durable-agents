@@ -28,6 +28,10 @@ dependencies = [
 # itself never imports FastAPI — only durable_agents.api.app does, and
 # plenty of users will drive runs from their own application instead.
 api = ["fastapi>=0.115"]
+# OpenAICompatibleClient — only needed if you use the built-in reference
+# LLM client. Anyone implementing their own LLMClient (or using
+# ScriptedLLM) never touches httpx.
+openai = ["httpx>=0.27"]
 
 [dependency-groups]
 dev = [

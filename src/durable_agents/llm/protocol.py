@@ -29,9 +29,12 @@ class LLMClient(ABC):
     ) -> LLMResponse:
         """Send messages + tool schemas to the model, return its response.
 
-        tools is a list of raw JSON tool schemas (provider wire format),
-        not the tool registry's own Tool type — this keeps the LLM layer
-        decoupled from tools/registry.py's internal representation.
+        tools is a neutral shape — [{"name", "description", "parameters":
+        <json schema>}, ...] — not any one provider's wire format and
+        not the tool registry's own Tool type. Translating that into
+        whatever your provider actually expects (Anthropic wants
+        input_schema; OpenAI wants it wrapped in {"type": "function",
+        "function": {...}}) is this method's job.
 
         system_prompt arrives as a separate argument rather than as a
         message because providers model it separately on the wire, and

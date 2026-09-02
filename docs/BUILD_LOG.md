@@ -2133,5 +2133,91 @@ tests passing.
 
 ### Phase 1 remaining
 
-Nothing. Phase 2 next: `AnthropicClient`, live-tests tier,
+Nothing. Phase 2 next: a real provider client, live-tests tier,
 `POST /runs`.
+
+---
+
+## Iteration 26 — a generic provider client, not a vendor-specific one (Phase 2, item 1)
+
+### Questioned before building: why does spec say "AnthropicClient"?
+
+User pushed back on the plan directly: *"why only AnthropicClient,
+shouldn't it be generic?"* Spec's Component 5 does name `AnthropicClient`
+literally. Examined it and agreed it was the same bias shape already
+caught once this project (Iteration 17's PII-pattern correction) —
+`LLMClient` itself was always a vendor-neutral ABC (one method, any
+provider), but the only *concrete implementation* spec asked for was
+tied to one company's SDK. For a library whose stated goal is "anyone
+in the world downloads and uses it," defaulting to one vendor's format
+is the wrong call.
+
+### Chosen: `OpenAICompatibleClient`, covering the format most providers actually speak
+
+The OpenAI chat-completions wire format isn't just OpenAI's anymore —
+Azure OpenAI, Ollama, vLLM, Groq, Together, OpenRouter, and most other
+local/open-source model servers all expose the same shape. One HTTP
+client against that shape covers more real usage than a dedicated
+Anthropic SDK wrapper would, for less code. A dedicated `AnthropicClient`
+remains buildable later against the same `LLMClient` interface — this
+isn't "the" official client, just the one with the broadest reach for a
+single implementation.
+
+### A second vendor leak, found while building the first fix
+
+`orchestrator._tool_schemas()` had been emitting
+`{"name", "description", "input_schema"}` since Week 2 —
+`input_schema` is Anthropic's own field name, hardcoded into the
+orchestrator itself. Every future client, including the supposedly
+generic one, would have had to know that quirk just to consume what the
+orchestrator handed it — backwards from `LLMClient.call()`'s own
+docstring, which already claimed tools arrive in "provider wire format"
+that the client translates. Fixed: renamed to the neutral `parameters`.
+Flagged and confirmed with the user first since `orchestrator.py` is a
+write-yourself file; one-line change, no test asserted the old key name.
+
+### `OpenAICompatibleClient`
+
+`llm/openai_compatible.py`. Notable choices:
+- **Cost from configurable per-1k-token rates**, not a hardcoded price
+  table — prices vary by model and go stale fast, and hardcoding one
+  vendor's numbers into a "generic" client would just be the same bias
+  problem again. Defaults to `$0` if unconfigured.
+- **No internal retry.** `Orchestrator` already retries a failed LLM
+  call with backoff, reading the budget from the event log (Iteration
+  24). Retrying again here would double the backoff for no benefit.
+- **`tool_call_id` recovered by pairing, not persisted.** OpenAI
+  requires a tool-result message to carry the id of the assistant
+  `tool_calls` entry it answers, but `durable_agents` events never store
+  that id past the turn that produced it. Rather than add a field to
+  `ToolCallRequested`/`ToolCallCompleted` for a client-side formatting
+  detail, the client pairs each tool-role message with the immediately
+  preceding assistant message's `tool_calls[0].id` — valid because the
+  orchestrator only ever acts on one tool call per step today.
+- **`transport` constructor parameter** as a pure test seam
+  (`httpx.MockTransport`) — never something a real caller sets.
+- Shipped as an **optional `openai` extra** (`httpx`), not a hard
+  dependency, and deliberately **not imported from the top-level
+  package** — same pattern already used for the FastAPI `api` extra, so
+  a base `pip install durable-agents` never touches `httpx`.
+
+### Tests
+
+6 new tests in `test_openai_compatible_client.py`, using
+`httpx.MockTransport` (no real network): plain text response parsed,
+tool-call response parsed, cost computed from configured rates and
+defaulting to zero otherwise, full request-shape verification (system
+prompt placement, tool schema translation, and — the one that actually
+proves the pairing logic works — a 3-message conversation where the
+tool-role message correctly receives the preceding assistant's
+`tool_calls[0].id`), and an HTTP error status raising rather than being
+swallowed (so the orchestrator's own retry logic actually sees it).
+
+**Full regression:** `mypy --strict` clean across 55 source files,
+114/114 tests passing, chaos suite re-verified stable (16/16) after the
+`_tool_schemas()` rename.
+
+### Phase 2 remaining
+
+Live-tests tier, `POST /runs`, then the L1 classifier sub-layer this
+unblocks.
