@@ -17,6 +17,13 @@ class PendingApprovalResponse(BaseModel):
     reason: str
 
 
+class PendingApprovalListItem(BaseModel):
+    run_id: UUID
+    tool: str
+    arguments: dict[str, Any]
+    reason: str
+
+
 class RunStatusResponse(BaseModel):
     run_id: UUID
     status: RunStatus
@@ -118,6 +125,29 @@ def create_app(
         )
         await store.append(run_id, 0, started)
         return _status_response(run_id, rebuild_state([started]))
+
+    @app.get("/approvals", response_model=list[PendingApprovalListItem])
+    async def list_pending_approvals(
+        limit: int = 100,
+        store: EventStore = Depends(get_store),
+    ) -> list[PendingApprovalListItem]:
+        # An approver's dashboard needs to discover what needs a
+        # decision without already knowing a run_id for each one — that
+        # is the whole reason this exists. A dedicated resource rather
+        # than a filtered /runs, since this queue is not "runs,
+        # restricted somehow" — it's its own thing, and /runs?status=...
+        # would misleadingly read as a general run-lister that 400s on
+        # every value but one.
+        pending = await store.find_awaiting_approval(limit=limit)
+        return [
+            PendingApprovalListItem(
+                run_id=run_id,
+                tool=event.tool,
+                arguments=event.arguments,
+                reason=event.reason,
+            )
+            for run_id, event in pending
+        ]
 
     @app.get("/runs/{run_id}", response_model=RunStatusResponse)
     async def get_run_status(

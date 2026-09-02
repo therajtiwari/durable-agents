@@ -1,6 +1,13 @@
+from datetime import datetime, timezone
 from uuid import UUID
 
-from durable_agents.events import Event
+from durable_agents.events import ApprovalRequested, Event
+from durable_agents.storage.protocol import (
+    NO_WORKER_HOLDING_EVENT_TYPES as _NO_WORKER_HOLDING,
+)
+from durable_agents.storage.protocol import (
+    TERMINAL_OR_PARKED_EVENT_TYPES as _TERMINAL_OR_PARKED,
+)
 from durable_agents.storage.protocol import ConcurrencyConflict, EventStore
 
 
@@ -39,6 +46,42 @@ class InMemoryEventStore(EventStore):
 
     async def read_since(self, run_id: UUID, seq: int) -> list[Event]:
         return [e for e in self._events.get(run_id, []) if e.seq > seq]
+
+    async def find_resumable_runs(
+        self, *, stale_after_seconds: float, limit: int = 10
+    ) -> list[UUID]:
+        now = datetime.now(timezone.utc)
+        candidates: list[tuple[datetime, UUID]] = []
+
+        for run_id, events in self._events.items():
+            if not events:
+                continue
+            latest = events[-1]
+            if latest.type in _TERMINAL_OR_PARKED:
+                continue
+            if latest.type not in _NO_WORKER_HOLDING:
+                age = (now - latest.created_at).total_seconds()
+                if age < stale_after_seconds:
+                    continue
+            candidates.append((latest.created_at, run_id))
+
+        candidates.sort(key=lambda pair: pair[0])
+        return [run_id for _, run_id in candidates[:limit]]
+
+    async def find_awaiting_approval(
+        self, *, limit: int = 100
+    ) -> list[tuple[UUID, ApprovalRequested]]:
+        candidates: list[tuple[datetime, UUID, ApprovalRequested]] = []
+
+        for run_id, events in self._events.items():
+            if not events:
+                continue
+            latest = events[-1]
+            if isinstance(latest, ApprovalRequested):
+                candidates.append((latest.created_at, run_id, latest))
+
+        candidates.sort(key=lambda triple: triple[0])
+        return [(run_id, event) for _, run_id, event in candidates[:limit]]
 
     def run_ids(self) -> list[UUID]:
         """Every run this store has seen. Not part of the EventStore

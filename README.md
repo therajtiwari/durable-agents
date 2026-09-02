@@ -117,6 +117,26 @@ refund, and what did the agent know at the time?" is
 `SELECT * FROM events WHERE run_id = $1 ORDER BY seq`. Three months
 later, it still answers.
 
+**A worker, so runs finish themselves.** Durability without this is
+only half the story: the log survives, but a run whose process died
+sits there until a human notices. A `Worker` polls for runs that need
+work — brand new ones, ones a human just approved, and ones that have
+gone quiet long enough to be presumed abandoned — and resumes them.
+
+```python
+from durable_agents import Worker
+
+worker = Worker(runtime, stale_after_seconds=60.0)
+await worker.run_forever()
+```
+
+That's the "a pod dies, a minute later something else picks the run up"
+story, and the idempotency keys already in the log are what make it
+safe to re-run a step whose outcome was never recorded. Spec describes
+a worker and a recovery sweeper as separate processes; they're the same
+mechanism with a different threshold, so this is one class — run two
+instances with different `stale_after_seconds` if you want the split.
+
 **Guardrails, optionally.** Four layers — input scan, tool-result scan,
 output validation, run-level loop/escalation detection — each emitting
 `GuardrailTriggered` into the same log. See
@@ -300,10 +320,13 @@ Read this part before adopting.
   the OpenAI wire format, you supply your own `LLMClient`.
 - **Postgres or in-memory only.** No SQLite, MySQL, or Redis store.
 - **Async only**, Python 3.12+.
-- **Single-process execution per run.** Safe under concurrent workers,
-  but there's no distributed scheduler — no worker pool, and **no
-  recovery sweeper yet**, so today a crashed run is resumed by you
-  calling `resume()`, not automatically.
+- **Recovery is poll-based, not instant.** `Worker` finds abandoned
+  runs by looking for ones that have gone quiet, since nothing in the
+  log records "a live process is holding this". That means a
+  `stale_after_seconds` threshold you have to set above your slowest
+  single operation, and if you set it too low two workers race — safe
+  (proven by `tests/integration/test_concurrent_workers.py`) but it
+  doubles that run's model spend. No leases, no distributed scheduler.
 - **The guardrails are pattern-based, not a model.** They catch
   unsophisticated injection and obvious PII; they will not stop a
   determined attacker. Measured on the bundled 80-case corpus:

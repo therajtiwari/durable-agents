@@ -13,29 +13,8 @@ from durable_agents.events import (
     LLMCallRequested,
     RunStarted,
 )
-from durable_agents.storage.protocol import ConcurrencyConflict, EventStore
+from durable_agents.storage.memory import InMemoryEventStore
 
-
-class InMemoryEventStore(EventStore):
-    """Same fake used in test_orchestrator.py — mirrors the (run_id, seq)
-    concurrency semantics without a real database, since these tests are
-    about the API layer's request/response handling, not storage.
-    """
-
-    def __init__(self) -> None:
-        self._events: dict[UUID, list[Event]] = {}
-
-    async def append(self, run_id: UUID, expected_seq: int, event: Event) -> None:
-        events = self._events.setdefault(run_id, [])
-        if expected_seq != len(events):
-            raise ConcurrencyConflict(f"seq {expected_seq} already taken for run {run_id}")
-        events.append(event)
-
-    async def read(self, run_id: UUID) -> list[Event]:
-        return list(self._events.get(run_id, []))
-
-    async def read_since(self, run_id: UUID, seq: int) -> list[Event]:
-        return [e for e in self._events.get(run_id, []) if e.seq > seq]
 
 
 def _run_started() -> RunStarted:
@@ -214,3 +193,28 @@ def test_approve_when_not_awaiting_approval_returns_409() -> None:
     response = client.post(f"/runs/{run_id}/approve", json={"approver": "priya.n"})
 
     assert response.status_code == 409
+
+
+def test_list_pending_approvals_returns_parked_runs() -> None:
+    store = InMemoryEventStore()
+    run_id = uuid4()
+    _park_on_approval(store, run_id)
+    # A run that hasn't asked for anything must not show up in the queue.
+    asyncio.run(store.append(uuid4(), 0, _run_started()))
+
+    client = TestClient(create_app(store))
+    response = client.get("/approvals")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body) == 1
+    assert body[0]["run_id"] == str(run_id)
+    assert body[0]["tool"] == "issue_refund"
+    assert body[0]["arguments"]["amount_inr"] == 6400
+
+
+def test_list_pending_approvals_empty_queue() -> None:
+    client = TestClient(create_app(InMemoryEventStore()))
+    response = client.get("/approvals")
+    assert response.status_code == 200
+    assert response.json() == []

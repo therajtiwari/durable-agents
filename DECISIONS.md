@@ -269,6 +269,54 @@ step; would need revisiting if that ever changes.
 
 ---
 
+## Worker and recovery
+
+**Staleness is inferred from the newest event, not from a lease.**
+The hard problem: a run being actively worked by a live process looks
+identical in the log to one whose worker died mid-operation — nothing
+records "a worker is holding this". Rejected: a leases table where a
+worker claims a run with an expiry. That would be a second source of
+truth alongside the event log, need renewal and expiry handling, and
+reintroduce exactly the lock-leaking failure modes the `(run_id, seq)`
+primary key design was chosen to avoid.
+
+Instead `find_resumable_runs` reads the *type* of the newest event:
+`RunStarted`, `ApprovalGranted`, and `ApprovalDenied` prove no worker
+can be mid-operation (nobody has begun it, or a human just acted), so
+those are returned immediately — which is what lets a run created over
+the API start right away instead of waiting out a threshold. Anything
+else might mean a worker is inside an LLM call, a tool call, or a retry
+backoff, so it waits for `stale_after_seconds` of silence.
+
+The tradeoff is stated rather than hidden: set the threshold too low
+and two workers race. That is *safe* — `(run_id, seq)` already makes
+concurrent execution correct, proven in
+`tests/integration/test_concurrent_workers.py` — but it duplicates
+model spend for that run. Wasted money, never corruption.
+
+**One `Worker` class, not a separate Worker and Sweeper.** Spec
+describes them as two processes. They are the same mechanism — find a
+run_id, call `resume()` — differing only in how long a run must be
+quiet before it's considered abandoned, so that duration is a
+parameter. Run one instance for both jobs, or two with different
+thresholds for spec's split. A deliberate divergence, documented rather
+than silently followed.
+
+**The Worker ships in the library, not in `examples/`.** It takes a
+`Runtime`, which already carries the consumer's tools and LLM client,
+so nothing about it is demo-specific. This is the piece that turns
+"durable" into "self-healing" — leaving every consumer to rewrite the
+same polling loop would mean the project's most quotable property is
+demonstrated but not actually shipped.
+
+**A failing run is logged and skipped, not allowed to kill the loop.**
+`poll_once` catches per-run exceptions so one poisoned run can't become
+an outage for every other run; `run_forever` separately catches
+failures of the polling query itself so the worker recovers when a
+database comes back rather than needing a restart.
+
+---
+
 ## Known open questions
 
 Recorded rather than quietly settled:

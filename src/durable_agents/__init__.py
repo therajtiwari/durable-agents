@@ -61,6 +61,7 @@ from durable_agents.storage.postgres import PostgresEventStore
 from durable_agents.storage.protocol import ConcurrencyConflict, EventStore
 from durable_agents.storage.schema import create_schema, schema_sql
 from durable_agents.tools.registry import Tool, idempotency_key, tool
+from durable_agents.worker import Worker
 
 __version__ = "0.1.0"
 
@@ -68,6 +69,7 @@ __all__ = [
     # The five names most users need
     "Runtime",
     "Run",
+    "Worker",
     "tool",
     "InMemoryEventStore",
     "PostgresEventStore",

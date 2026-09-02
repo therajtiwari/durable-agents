@@ -763,14 +763,39 @@ clean (63 files), 120/120 non-live tests. Full detail:
 
 ### Phase 3 — make it self-healing (the actual production story)
 
-11. **Recovery sweeper** — a periodic job running the dangling-
-    `Requested` query and re-enqueueing orphaned runs. This is what
-    turns crash-resume from a manual CLI command into an automatic
-    property of the system, and it is the single most quotable thing in
-    the whole project ("a pod dies, a minute later something else picks
-    the run up"). Not built at all.
+11. **Worker / recovery sweeper** ✅ DONE (Iteration 31) — prompted by
+    the user asking "why do I have to resume every time?" after
+    creating a run over the API and watching nothing happen. The honest
+    answer: spec's three-process architecture only had its API built,
+    so *the user was the worker*.
+
+    `EventStore.find_resumable_runs()` + `Worker` in
+    `src/durable_agents/worker.py`. Three decisions settled first:
+    (a) staleness inferred from the newest event's *type* rather than a
+    leases table — `RunStarted`/`ApprovalGranted`/`ApprovalDenied` prove
+    no worker is mid-operation so they're picked up immediately (this is
+    what makes a new run start right away), everything else waits out
+    `stale_after_seconds`; too low a threshold means two workers race,
+    which is safe (proven Week 4) but doubles that run's model spend —
+    wasted money, never corruption. (b) One `Worker` class, not a
+    separate Worker and Sweeper — same mechanism, different threshold;
+    a documented divergence from spec. (c) Ships in the library, not
+    `examples/`, since it takes a `Runtime` and is not demo-specific.
+
+    Also deleted ~60 lines of duplicated `InMemoryEventStore` fakes
+    across three test files, which now use the shipped implementation.
+
+    16 new tests (10 unit + 6 Postgres integration, the latter because
+    the SQL can disagree with the Python while still returning
+    *something*). Verified end-to-end against real Postgres twice: a
+    run created over HTTP completing with no `resume()` called anywhere,
+    and a hand-written crashed-mid-LLM-call log recovered by a fresh
+    worker that never saw the dead process. `examples/run_worker.py`
+    added. Full regression: `mypy --strict` clean (67 files), 136/136
+    non-live tests. Full detail: `docs/BUILD_LOG.md` iteration 31.
 12. **Dockerfile + deploy** — API + worker + sweeper as three
-    processes, per spec's own architecture.
+    processes, per spec's own architecture. The worker itself now
+    exists; this is packaging it for a real deployment.
 
 ---
 
@@ -834,3 +859,41 @@ clean (63 files), 120/120 non-live tests. Full detail:
 - **L1 `ESCALATE` fails closed** (BLOCK) because there's no tool call
   in context to attach an `ApprovalRequested` to. Needs either a schema
   change or a deliberate decision to keep failing closed.
+
+## Week 6, Day 2 — approval queue: `GET /approvals`
+
+Real gap surfaced while manually testing the approval flow: the API
+could check one run's status but had no way to discover *which* runs
+needed a decision without already knowing their `run_id`s — no queue
+for an approver to look at.
+
+- `EventStore.find_awaiting_approval()` — same technique as
+  `find_resumable_runs` (Iteration 31): infer status from the newest
+  event's type, no full rebuild. A run is `awaiting_approval` iff its
+  newest event is `ApprovalRequested`, which already carries
+  `tool`/`arguments`/`reason` needed for the listing.
+  `storage/postgres.py` (`DISTINCT ON` SQL) and `storage/memory.py`
+  (plain Python) both implement it; `storage/protocol.py` declares it.
+- `api/app.py`: `GET /approvals` — returns `[{run_id, tool, arguments,
+  reason}, ...]`. Shipped first as `GET /runs?status=awaiting_approval`,
+  renamed same day on user request ("can't there be a better
+  endpoint") — `/runs` reads as a general run-lister but only ever
+  accepted one status value, misleading generality for what's really
+  its own resource. `/approvals` also sidesteps a FastAPI route-ordering
+  trap that `GET /runs/pending-approvals` would have needed (registering
+  before `/runs/{run_id}` so the UUID-typed path param doesn't swallow
+  the literal segment first).
+- Rejected alternative, discussed with user first: a materialized
+  `run_status` projection table kept in sync on every approval event —
+  faster at very high volume, but a second copy of state that can drift
+  from the event log, the exact risk this project's architecture exists
+  to avoid. Not justified at current scale.
+- 10 new tests (4 unit against `InMemoryEventStore`, 4 integration
+  against real Postgres mirroring `test_find_resumable_runs.py`, 2 API
+  tests). Hit and fixed a real pytest gotcha: the unit and integration
+  test files couldn't share a basename (`test_find_awaiting_approval.py`)
+  since neither test directory has `__init__.py` — pytest's bare-module
+  import collided across them. Renamed the unit file.
+- Full regression: `mypy --strict` clean (59 files), 146/146 non-live
+  tests passing, 2 deselected as designed. Full detail:
+  `docs/BUILD_LOG.md` iteration 32.

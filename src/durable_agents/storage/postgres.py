@@ -4,8 +4,13 @@ from uuid import UUID
 import asyncpg
 from pydantic import TypeAdapter
 
-from durable_agents.events import Event
-from durable_agents.storage.protocol import ConcurrencyConflict, EventStore
+from durable_agents.events import ApprovalRequested, Event
+from durable_agents.storage.protocol import (
+    NO_WORKER_HOLDING_EVENT_TYPES,
+    TERMINAL_OR_PARKED_EVENT_TYPES,
+    ConcurrencyConflict,
+    EventStore,
+)
 
 _event_adapter: TypeAdapter[Event] = TypeAdapter(Event)
 
@@ -54,6 +59,69 @@ class PostgresEventStore(EventStore):
             seq,
         )
         return [self._row_to_event(row) for row in rows]
+
+    async def find_resumable_runs(
+        self, *, stale_after_seconds: float, limit: int = 10
+    ) -> list[UUID]:
+        # DISTINCT ON (run_id) ... ORDER BY run_id, seq DESC gives the
+        # newest event per run using the (run_id, seq) primary key index.
+        #
+        # Note this compares the app-set created_at against the database
+        # clock (now()). Clock skew between an application host and the
+        # database shifts the effective staleness threshold slightly;
+        # harmless here because racing workers are already safe, but
+        # worth knowing before tightening the threshold.
+        rows = await self._pool.fetch(
+            """
+            WITH latest AS (
+                SELECT DISTINCT ON (run_id) run_id, type, created_at
+                FROM events
+                ORDER BY run_id, seq DESC
+            )
+            SELECT run_id
+            FROM latest
+            WHERE type <> ALL($1::text[])
+              AND (
+                  type = ANY($2::text[])
+                  OR created_at < now() - make_interval(secs => $3)
+              )
+            ORDER BY created_at
+            LIMIT $4
+            """,
+            list(TERMINAL_OR_PARKED_EVENT_TYPES),
+            list(NO_WORKER_HOLDING_EVENT_TYPES),
+            stale_after_seconds,
+            limit,
+        )
+        return [row["run_id"] for row in rows]
+
+    async def find_awaiting_approval(
+        self, *, limit: int = 100
+    ) -> list[tuple[UUID, ApprovalRequested]]:
+        # Same DISTINCT ON trick as find_resumable_runs: newest row per
+        # run_id off the (run_id, seq) primary key index, then keep only
+        # the ones whose newest row actually is ApprovalRequested.
+        rows = await self._pool.fetch(
+            """
+            WITH latest AS (
+                SELECT DISTINCT ON (run_id) run_id, seq, type, payload, created_at
+                FROM events
+                ORDER BY run_id, seq DESC
+            )
+            SELECT run_id, seq, type, payload, created_at
+            FROM latest
+            WHERE type = 'ApprovalRequested'
+            ORDER BY created_at
+            LIMIT $1
+            """,
+            limit,
+        )
+        results: list[tuple[UUID, ApprovalRequested]] = []
+        for row in rows:
+            event = self._row_to_event(row)
+            assert isinstance(event, ApprovalRequested)
+            results.append((row["run_id"], event))
+        return results
 
     @staticmethod
     def _row_to_event(row: asyncpg.Record) -> Event:

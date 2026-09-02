@@ -2567,3 +2567,228 @@ cleanly with the intended message and a nonzero exit code.
 
 **Full regression:** `mypy --strict` clean across 63 files, 120/120
 non-live tests passing, 2 deselected as designed.
+
+---
+
+## Iteration 31 — the Worker: durability becomes self-healing (Phase 3)
+
+The gap this closes was found by the user actually using the thing:
+they created a run over `POST /runs`, watched nothing happen, and asked
+"why do I have to resume every time? why can't it flow on after I click
+run?" The honest answer was that spec's three-process architecture
+(API, worker, sweeper) only had its API built — *the user was the
+worker*. This iteration builds the missing piece.
+
+### Three design decisions, settled before writing anything
+
+**1. How does a worker tell a live run from an abandoned one?** This is
+the whole problem: a run being actively worked looks identical in the
+log to one whose process died — nothing records "a worker is holding
+this". Rejected a leases table (second source of truth, renewal/expiry
+handling, reintroduces the lock-leaking failure modes `(run_id, seq)`
+was chosen to avoid). Chose to infer it from the *type* of the newest
+event, with a hybrid threshold:
+
+- `RunStarted`, `ApprovalGranted`, `ApprovalDenied` prove no worker can
+  be mid-operation — nobody has begun the run, or a human just acted.
+  Returned immediately, which is exactly what makes a newly created run
+  start right away rather than a minute later.
+- Anything else might mean a worker is inside an LLM call, a tool call,
+  or a retry backoff. Waits for `stale_after_seconds` of silence.
+
+The tradeoff is real and documented rather than hidden: too low a
+threshold means two workers race. That is *safe* —
+`tests/integration/test_concurrent_workers.py` already proved
+concurrent execution correct back in Week 4 — but it duplicates model
+spend. Wasted money, never corruption.
+
+**2. Worker and sweeper as one class or two?** Spec lists two
+processes. They're the same mechanism (find a run_id, call `resume()`)
+differing only in threshold, so: one `Worker` with that duration as a
+parameter. Run one instance for both jobs, two with different
+thresholds for spec's split. Documented as a deliberate divergence.
+
+**3. Library or examples?** In the library. A `Worker` takes a
+`Runtime`, which already carries the consumer's tools and LLM client,
+so nothing about it is demo-specific — and leaving every consumer to
+rewrite the same polling loop would mean the project's most quotable
+property is only demonstrated, never shipped.
+
+### What got built
+
+`EventStore` gained `find_resumable_runs(stale_after_seconds, limit)`,
+implemented in both stores against shared
+`TERMINAL_OR_PARKED_EVENT_TYPES` / `NO_WORKER_HOLDING_EVENT_TYPES`
+constants in `storage/protocol.py` — deliberately shared so a worker
+can't get different answers depending on which store it's pointed at.
+The Postgres version uses `DISTINCT ON (run_id) ... ORDER BY run_id,
+seq DESC` (riding the primary key index) plus `make_interval`; noted in
+a comment that it compares the app-set `created_at` against the
+database's `now()`, so clock skew shifts the effective threshold
+slightly — harmless while racing is safe, but worth knowing before
+tightening it.
+
+`worker.py`: `Worker(runtime, stale_after_seconds=, poll_interval_seconds=,
+batch_size=)` with `poll_once()` (one pass, returns what it worked —
+separate so tests can drive it without an infinite loop) and
+`run_forever(stop=)`. Error handling is two-layered on purpose:
+`poll_once` catches per-run exceptions so one poisoned run can't become
+an outage for every other run, and `run_forever` separately catches
+failures of the polling query itself so the worker recovers when a
+database comes back instead of needing a restart. Shutdown waits on the
+stop event rather than sleeping blindly, so it's immediate rather than
+taking up to a full poll interval.
+
+### A cleanup the new abstract method forced, and it was worth it
+
+Adding an abstract method broke three test files that each hand-rolled
+their own `InMemoryEventStore` copy — duplicated back when the real one
+lived only in tests. Rather than add the method to three fakes, deleted
+all three and pointed them at the shipped `InMemoryEventStore`: ~60
+lines removed, and those tests now exercise the actual shipped
+implementation rather than a lookalike that could drift from it.
+
+### Tests
+
+`tests/unit/test_worker.py`, 10 tests — six pinning down the
+classification heuristic (brand-new run immediate, just-approved run
+immediate, in-progress run left alone until stale, abandoned run
+recovered, finished/parked never returned, oldest-first ordering and
+limit) and four on the Worker itself.
+
+One of those, `test_one_failing_run_does_not_stop_the_worker`, was
+wrong on the first attempt and the failure was instructive: it tried to
+poison a run with an LLM error, but the orchestrator's own retry logic
+(Iteration 24) caught it, retried, and the run *completed* — an LLM
+failure never escapes `resume()` at all, so it wasn't testing the
+worker's error isolation. Rewritten to fail at the store level, which
+the orchestrator genuinely cannot swallow. The test comment records
+why, since the first version looked perfectly reasonable.
+
+`tests/integration/test_find_resumable_runs.py`, 6 tests against real
+Postgres — because the heuristic being right in Python says nothing
+about whether the SQL implements the same rules; a query using
+`DISTINCT ON`, `make_interval`, and array containment has plenty of
+room to disagree while still returning *something*.
+
+### Verified end to end, twice, against real Postgres
+
+Not just unit tests — ran the actual loop:
+
+1. **The "why doesn't it just flow" fix:** created a run over the real
+   HTTP API, started a `Worker`, and watched it reach `completed` with
+   no `resume()` called anywhere in the script. Replay confirms a clean
+   4-event trace.
+2. **The recovery half:** hand-wrote the log a process killed
+   mid-LLM-call leaves behind (dangling `LLMCallRequested`, no
+   outcome, old timestamp), then started a fresh `Worker` that never
+   saw the dead process — it identified the run as needing recovery and
+   finished it.
+
+`examples/run_worker.py` added so this is reproducible: run it beside
+`run_api_server.py`, POST a run, watch it get picked up within a
+second.
+
+**Full regression:** `mypy --strict` clean across 67 files (src, tests,
+examples), 136/136 non-live tests passing (16 new), 2 deselected as
+designed.
+
+### Phase 3 remaining
+
+The Dockerfile and an actual deployment. The recovery story itself —
+the part that was genuinely missing — now exists and is proven.
+
+## Iteration 32 — a queue for approvers: `GET /approvals`
+
+Prompted by a real gap the user found while trying to test the approval
+flow by hand: the API could only check a run's status if you already
+knew its `run_id`. In production nobody logging in to approve requests
+starts out knowing that — they need a queue.
+
+### The decision
+
+Two designs discussed first, per the standing rule (explain the
+approach and a rejected alternative, then wait):
+
+1. **Query the event log directly, no new table.** `find_resumable_runs`
+   (Iteration 31) already established the pattern this project uses for
+   "which runs need X right now": infer status from the *type* of each
+   run's newest event, not a rebuild or a second synced store. A run is
+   `awaiting_approval` exactly when its newest event is
+   `ApprovalRequested` — the state machine never appends anything else
+   while parked, the next event is always `ApprovalGranted` or
+   `ApprovalDenied`. That event already carries `tool`/`arguments`/
+   `reason`, so listing the queue needs `rebuild_state()` for none of
+   the matching runs, only the newest row.
+2. **Rejected: a materialized `run_status` projection table**, updated
+   whenever an approval event appends. Faster reads at very high
+   volume, but introduces a second copy of state that must stay in sync
+   with the event log by hand — the exact drift risk this project's
+   whole architecture exists to avoid, and nothing about current scale
+   justifies paying for it.
+
+User picked (1) — consistent with a technique the codebase already
+committed to, no new invariant, no sync burden.
+
+### What was built
+
+- `storage/protocol.py`: new abstract method `find_awaiting_approval(*,
+  limit=100) -> list[tuple[UUID, ApprovalRequested]]`.
+- `storage/postgres.py`: same `DISTINCT ON (run_id) ... ORDER BY
+  run_id, seq DESC` trick as `find_resumable_runs`, filtered to `type =
+  'ApprovalRequested'` in the outer query, ordered oldest-first. Parses
+  each row through the existing `_row_to_event` and asserts the result
+  narrows to `ApprovalRequested` (always true given the `WHERE`, but
+  makes the type concrete for `mypy --strict` rather than casting).
+- `storage/memory.py`: same rule in plain Python — a run qualifies iff
+  its last event `isinstance(..., ApprovalRequested)`.
+- `api/app.py`: `GET /approvals`. Response: `[{run_id, tool, arguments,
+  reason}, ...]`.
+
+**Revised same day, on request:** shipped first as `GET
+/runs?status=awaiting_approval`, then the user asked "can't there be a
+better endpoint" — right call. `/runs` reads as a general run-lister,
+but it only ever accepted one `status` value and 400'd on every other —
+misleading generality for what is really its own resource, not a
+filtered view of runs. Renamed to a dedicated `GET /approvals`, no
+query param. Rejected alternative considered at the same time: `GET
+/runs/pending-approvals` reads fine too, but requires registering it
+*before* `/runs/{run_id}` in FastAPI to avoid the UUID-typed path param
+swallowing the literal segment first (a 422 instead of falling through)
+— `/approvals` as its own top-level path avoids that ordering risk
+entirely. `find_awaiting_approval()` itself is unchanged; this was
+purely the HTTP surface.
+
+### A real production flow this unblocks
+
+An approver's system polls `GET /approvals` (or calls it on login) →
+renders the queue → approver acts via the existing
+`POST /runs/{id}/approve` or `/deny` → the `Worker` (Iteration 31)
+picks the run back up on its own. No step in that flow requires anyone
+to already know a `run_id`.
+
+### Tests
+
+`tests/unit/test_awaiting_approval_store.py`, 4 tests against
+`InMemoryEventStore` (parked run returned, not-yet-parked excluded,
+granted/denied runs no longer counted, oldest-first + limit).
+`tests/integration/test_find_awaiting_approval.py`, 4 tests against
+real Postgres, same shape as `test_find_resumable_runs.py` — checking
+the SQL actually agrees with the Python, not re-checking the rule
+itself. 3 new tests in `tests/unit/test_api.py` for the endpoint
+(returns the queue, rejects an unsupported `status`, requires `status`
+at all).
+
+Naming note: the unit test file could not share the integration test's
+basename (`test_find_awaiting_approval.py`) — neither `tests/unit` nor
+`tests/integration` has an `__init__.py`, so pytest's bare-module
+import collides across directories on an identical filename (hit this,
+fixed by renaming the unit file). `test_find_resumable_runs.py` never
+hit this because its own unit-side tests live inside the broader
+`test_worker.py`, not a same-named file.
+
+**Full regression (after the `/approvals` rename):** `mypy --strict`
+clean (59 files), 146/146 non-live tests passing (10 new — the
+"requires status"/"rejects unsupported status" tests no longer apply
+once the query param is gone, replaced by one empty-queue test), 2
+deselected as designed.

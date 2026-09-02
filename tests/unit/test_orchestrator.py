@@ -8,34 +8,10 @@ from durable_agents.events import ApprovalDenied, ApprovalGranted, Event, RunSta
 from durable_agents.llm.protocol import LLMResponse
 from durable_agents.llm.scripted import ScriptedLLM
 from durable_agents.orchestrator import Orchestrator
-from durable_agents.storage.protocol import ConcurrencyConflict, EventStore
+from durable_agents.storage.memory import InMemoryEventStore
 from durable_agents.tools.refund_tools import InMemoryRefundBackend, build_refund_tools
 from durable_agents.tools.registry import Tool
 
-
-class InMemoryEventStore(EventStore):
-    """Fake EventStore for testing orchestrator logic in isolation.
-
-    Mirrors PostgresEventStore's concurrency semantics (append only at the
-    next sequential seq) without touching a real database — these tests
-    are about the orchestrator's decisions, not storage correctness
-    (already covered by tests/integration/test_postgres_store.py).
-    """
-
-    def __init__(self) -> None:
-        self._events: dict[UUID, list[Event]] = {}
-
-    async def append(self, run_id: UUID, expected_seq: int, event: Event) -> None:
-        events = self._events.setdefault(run_id, [])
-        if expected_seq != len(events):
-            raise ConcurrencyConflict(f"seq {expected_seq} already taken for run {run_id}")
-        events.append(event)
-
-    async def read(self, run_id: UUID) -> list[Event]:
-        return list(self._events.get(run_id, []))
-
-    async def read_since(self, run_id: UUID, seq: int) -> list[Event]:
-        return [e for e in self._events.get(run_id, []) if e.seq > seq]
 
 
 def _now() -> datetime:
