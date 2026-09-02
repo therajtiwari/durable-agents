@@ -40,7 +40,14 @@ class OpenAICompatibleClient(LLMClient):
         extra_headers: dict[str, str] | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
-        self._base_url = base_url.rstrip("/")
+        # httpx merges base_url + a relative request path by raw
+        # concatenation, with no separator inserted — base_url must end
+        # with exactly one "/" and the request path must not start with
+        # one, or "https://host/v1" + "/chat/completions" silently
+        # becomes "https://host/v1chat/completions" (a real 404 this
+        # produced against a live server; no mocked test catches it,
+        # since a mock doesn't care what path it was asked for).
+        self._base_url = base_url.rstrip("/") + "/"
         self._model = model
         self._cost_per_1k_input = Decimal(str(cost_per_1k_input_tokens))
         self._cost_per_1k_output = Decimal(str(cost_per_1k_output_tokens))
@@ -71,8 +78,18 @@ class OpenAICompatibleClient(LLMClient):
         # failed LLM call with backoff (see orchestrator.py's _reconcile),
         # reading the attempt budget back out of the event log. Retrying
         # again at this layer would double the backoff for no benefit.
-        response = await self._client.post("/chat/completions", json=payload)
-        response.raise_for_status()
+        response = await self._client.post("chat/completions", json=payload)
+        if response.is_error:
+            # raise_for_status() alone discards the response body, which
+            # is the only place the provider says WHY — "model has been
+            # decommissioned", "insufficient quota", "context length
+            # exceeded". Without it a 404 is indistinguishable from a
+            # wrong URL, which cost real debugging time once already.
+            raise httpx.HTTPStatusError(
+                f"{response.status_code} from {response.request.url}: {response.text}",
+                request=response.request,
+                response=response,
+            )
         latency_ms = int((time.monotonic() - start) * 1000)
 
         body = response.json()

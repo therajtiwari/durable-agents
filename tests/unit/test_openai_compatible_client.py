@@ -169,6 +169,37 @@ async def test_request_shape_translates_messages_tools_and_system_prompt() -> No
 
 
 @pytest.mark.asyncio
+async def test_request_url_is_not_mangled_by_base_url_merging() -> None:
+    """Regression: httpx merges a client's base_url with a relative
+    request path by raw concatenation, with NO separator inserted. A
+    base_url without a trailing slash ("https://host/v1", the natural
+    way anyone writes one) plus a request path with a leading slash
+    ("/chat/completions") silently produced "https://host/v1chat/
+    completions" — a real 404 against Groq's live API that no earlier
+    test caught, because none of them asserted on the request URL
+    itself, only on the body and headers. A mock doesn't care what path
+    it was asked for; a real server does.
+    """
+
+    captured_urls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_urls.append(str(request.url))
+        return httpx.Response(200, json=_text_response())
+
+    # Deliberately no trailing slash — the exact shape that broke.
+    client = OpenAICompatibleClient(
+        base_url="https://api.groq.com/openai/v1",
+        model="test-model",
+        transport=httpx.MockTransport(handler),
+    )
+    await client.call([Message(role="user", content="hi")], tools=[])
+    await client.aclose()
+
+    assert captured_urls == ["https://api.groq.com/openai/v1/chat/completions"]
+
+
+@pytest.mark.asyncio
 async def test_http_error_status_raises_instead_of_swallowing() -> None:
     """Orchestrator's own retry/backoff (Iteration 24) is what should
     react to a failure — this client must not swallow one itself, or
