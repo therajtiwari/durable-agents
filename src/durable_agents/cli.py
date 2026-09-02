@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import os
+import sys
 from typing import assert_never
 from uuid import UUID, uuid4
 
@@ -24,6 +25,7 @@ from durable_agents.llm.scripted import ScriptedLLM
 from durable_agents.orchestrator import Orchestrator
 from durable_agents.state import rebuild_state
 from durable_agents.storage.postgres import PostgresEventStore
+from durable_agents.storage.schema import create_schema
 from durable_agents.tools.refund_backend_postgres import PostgresRefundBackend
 from durable_agents.tools.refund_demo_scenario import canonical_run_started, canonical_script
 from durable_agents.tools.refund_tools import build_refund_tools
@@ -150,6 +152,14 @@ async def _start_or_resume(run_id: UUID, dsn: str) -> None:
 
 
 def main() -> None:
+    # Windows consoles still default to a legacy codepage (cp1252),
+    # which raises UnicodeEncodeError on any non-ASCII character in a
+    # goal, tool result, or final answer — i.e. on most of the world's
+    # text. Printing a run's own recorded content must not depend on
+    # the operator's locale.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser(prog="durable-agents")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -158,6 +168,13 @@ def main() -> None:
     )
     replay_parser.add_argument("run_id", type=UUID)
     replay_parser.add_argument(
+        "--dsn", default=os.environ.get("DATABASE_URL", DEFAULT_DSN)
+    )
+
+    init_db_parser = subparsers.add_parser(
+        "init-db", help="Create the events table (idempotent, safe to re-run)"
+    )
+    init_db_parser.add_argument(
         "--dsn", default=os.environ.get("DATABASE_URL", DEFAULT_DSN)
     )
 
@@ -178,7 +195,10 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if args.command == "replay":
+    if args.command == "init-db":
+        asyncio.run(create_schema(args.dsn))
+        print(f"Schema ready on {args.dsn}")
+    elif args.command == "replay":
         asyncio.run(_replay(args.run_id, args.dsn))
     elif args.command == "start":
         run_id = uuid4()

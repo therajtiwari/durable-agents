@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from typing import Any
 
 from durable_agents.llm.protocol import LLMClient, LLMResponse
@@ -14,11 +15,25 @@ class ScriptedLLM(LLMClient):
     tested the same way a real provider error would be.
     """
 
-    def __init__(self, responses: list[LLMResponse | Exception]) -> None:
-        self.responses = responses
+    def __init__(self, responses: Sequence[LLMResponse | Exception]) -> None:
+        # Sequence, not list: list is invariant, so a caller passing a
+        # plain list[LLMResponse] (the common case — no failures being
+        # simulated) would otherwise fail type checking and have to
+        # annotate the union by hand.
+        self.responses = list(responses)
         self.call_count = 0
+        self.last_system_prompt: str = ""
 
-    async def call(self, messages: list[Message], tools: list[dict[str, Any]]) -> LLMResponse:
+    async def call(
+        self,
+        messages: list[Message],
+        tools: list[dict[str, Any]],
+        system_prompt: str = "",
+    ) -> LLMResponse:
+        # Recorded rather than used — a scripted response ignores its
+        # input by definition, but a test asserting the orchestrator
+        # actually forwards the prompt needs somewhere to look.
+        self.last_system_prompt = system_prompt
         response = self.responses[self.call_count]
         self.call_count += 1
         if isinstance(response, Exception):

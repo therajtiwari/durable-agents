@@ -54,6 +54,13 @@ class InFlightOp:
     tool: str | None = None
     arguments: dict[str, Any] | None = None
     idempotency_key: str | None = None
+    attempts: int = 0
+    """Failed attempts at this operation so far. Lives here rather than
+    in the orchestrator so a resumed process picks up the retry budget
+    exactly where a dead one left off — a retry count held in a local
+    variable would reset to zero on every crash, which for a flapping
+    provider means retrying forever.
+    """
 
 
 @dataclass(frozen=True)
@@ -100,6 +107,8 @@ class RunState:
     guardrail_hits: list[GuardrailHit] = field(default_factory=list)
     max_steps: int | None = None
     max_cost_usd: Decimal | None = None
+    system_prompt: str = ""
+    guardrail_profile: str | None = None
     final_answer: str | None = None
     failure_reason: str | None = None
 
@@ -113,6 +122,8 @@ def apply(state: RunState, event: Event) -> RunState:
                 messages=[Message(role="user", content=event.goal)],
                 max_steps=event.max_steps,
                 max_cost_usd=event.max_cost_usd,
+                system_prompt=event.system_prompt,
+                guardrail_profile=event.guardrail_profile,
             )
 
         case LLMCallRequested():
@@ -140,8 +151,16 @@ def apply(state: RunState, event: Event) -> RunState:
         case LLMCallFailed():
             # The dangling LLMCallRequested stays in_flight. Only a
             # Completed clears it — a failure alone doesn't resolve
-            # anything; a retry shows up as a fresh LLMCallRequested.
-            return state
+            # anything, it just means the same call gets attempted
+            # again. Recording the attempt on the op is what bounds
+            # that: the orchestrator reads it back to decide whether
+            # another try is still within budget.
+            if state.in_flight is None:
+                return state
+            return replace(
+                state,
+                in_flight=replace(state.in_flight, attempts=state.in_flight.attempts + 1),
+            )
 
         case ToolCallRequested():
             return replace(
@@ -174,11 +193,21 @@ def apply(state: RunState, event: Event) -> RunState:
             )
 
         case ToolCallFailed():
-            # Unlike LLMCallFailed, this clears in_flight rather than
-            # leaving it dangling: a tool failure (bad name, bad
-            # arguments, a real business error) isn't automatically safe
-            # to blindly auto-retry the way an LLM call is. Surface it to
-            # the model as a tool-result message instead, so it decides
+            if not event.final_attempt and state.in_flight is not None:
+                # A retry of this exact call is coming, reusing the same
+                # idempotency_key — so the op stays in flight and no
+                # message is added. Nothing is told to the model yet
+                # because nothing has been concluded yet.
+                return replace(
+                    state,
+                    step=event.step,
+                    in_flight=replace(state.in_flight, attempts=state.in_flight.attempts + 1),
+                )
+
+            # The attempt budget is spent (or there was never an op in
+            # flight at all — an unknown tool name fails before any
+            # ToolCallRequested is written). Clear it and surface the
+            # error to the model as a tool-result message, so it decides
             # what to do next rather than the orchestrator looping on the
             # same failing call forever.
             message = Message(

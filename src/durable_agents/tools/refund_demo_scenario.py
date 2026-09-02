@@ -78,7 +78,11 @@ def canonical_run_started(requested_by: str) -> RunStarted:
         created_at=datetime.now(timezone.utc),
         goal="Process refund for order A-8891.",
         model="scripted",
-        system_prompt_hash="sha256:demo",
+        system_prompt=(
+            "You are a customer support agent handling refunds. "
+            "Look up the order and check the refund policy before issuing any refund. "
+            "Never refund more than the order's value."
+        ),
         max_steps=15,
         max_cost_usd=Decimal("2.00"),
         requested_by=requested_by,

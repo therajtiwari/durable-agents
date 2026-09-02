@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
-from pydantic import create_model
+from pydantic import BaseModel, create_model
 
 
 @dataclass(frozen=True)
@@ -18,17 +18,23 @@ class Tool:
     requires_approval: Callable[[dict[str, Any]], bool]
     func: Callable[..., Awaitable[Any]]
     needs_idempotency_key: bool
+    args_model: type[BaseModel]
+    """The same Pydantic model _build_parameters_model derives `parameters`
+    (the JSON schema) from — kept around so L3 output validation
+    (guardrails/output_validate.py) can re-validate a live tool call's
+    arguments with model_validate() instead of re-deriving a second
+    schema-checking path from scratch.
+    """
 
     async def execute(self, **kwargs: Any) -> Any:
         return await self.func(**kwargs)
 
 
-def _build_parameters_schema(func: Callable[..., Awaitable[Any]]) -> dict[str, Any]:
-    """Auto-derive a JSON schema for func's parameters from its type hints.
-
-    Excludes a parameter literally named idempotency_key: that value is
-    computed and injected by the orchestrator, never something the model
-    should see as a field to fill in or invent.
+def _build_parameters_model(func: Callable[..., Awaitable[Any]]) -> type[BaseModel]:
+    """Auto-derive a Pydantic model for func's parameters from its type
+    hints. Excludes a parameter literally named idempotency_key: that
+    value is computed and injected by the orchestrator, never something
+    the model should see as a field to fill in or invent.
     """
 
     signature = inspect.signature(func)
@@ -40,7 +46,11 @@ def _build_parameters_schema(func: Callable[..., Awaitable[Any]]) -> dict[str, A
         default = param.default if param.default is not inspect.Parameter.empty else ...
         fields[name] = (annotation, default)
 
-    model = create_model(func.__name__, **fields)
+    model: type[BaseModel] = create_model(func.__name__, **fields)
+    return model
+
+
+def _build_parameters_schema(model: type[BaseModel]) -> dict[str, Any]:
     schema: dict[str, Any] = model.model_json_schema()
     schema.pop("title", None)
     return schema
@@ -67,14 +77,16 @@ def tool(
 
     def decorator(func: Callable[..., Awaitable[Any]]) -> Tool:
         needs_idempotency_key = "idempotency_key" in inspect.signature(func).parameters
+        args_model = _build_parameters_model(func)
         return Tool(
             name=func.__name__,
             description=inspect.getdoc(func) or "",
-            parameters=_build_parameters_schema(func),
+            parameters=_build_parameters_schema(args_model),
             side_effect=side_effect,
             requires_approval=approval_check,
             func=func,
             needs_idempotency_key=needs_idempotency_key,
+            args_model=args_model,
         )
 
     return decorator

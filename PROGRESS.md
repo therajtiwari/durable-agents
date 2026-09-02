@@ -357,5 +357,386 @@ Per spec section 18:
 - Measure attack success rate **and** false positive rate
 
 `guardrails/decisions.py` is the user's last untouched write-yourself
-file. Done when there are before/after numbers for both metrics and the
-PII-ordering test passes.
+file.
+
+**Threat model written (2026-09-02):** `docs/THREAT_MODEL.md` — the six
+threat categories mapped to this project's actual surface (goal text,
+the three refund tools), which layer catches what, this week's
+deliberate scope cuts, and a first proposal for `strict`/`standard`/
+`lenient` guardrail_profile thresholds (not binding — `decisions.py`'s
+call). Full detail: `docs/BUILD_LOG.md` iteration 17.
+
+**Correction, same day:** first draft hardcoded India-specific PII
+patterns (PAN/Aadhaar/IFSC) as if they belonged in the core engine —
+copied from spec's example without questioning it. User caught this as
+bias against a library meant to ship worldwide. Fixed: PII patterns are
+now a pluggable parameter, core ships only locale-neutral defaults
+(credit card, email, phone, IBAN); country-specific patterns are
+consumer config. Same fix applied to the policy cap (config, not a
+hardcoded ₹ constant). Doc updated in place.
+
+## Week 5, Day 1 (continued) — L1 input scan built
+
+- `guardrails/types.py`: `GuardMatch`, `ScanResult` — detection-only,
+  no `GuardAction` (that's `decisions.py`).
+- `guardrails/patterns.py`: shared injection-pattern list + PII pattern
+  list (locale-neutral: email, Luhn-validated credit card, IBAN, phone)
+  + `scan_pii()`'s redact-and-restore logic. Built shared, not
+  duplicated, since L2 needs the identical logic later this week.
+- `guardrails/input_scan.py`: `scan_input(goal, pii_patterns=...)` —
+  plain function, not a class (spec's sketch shows a class; diverged
+  deliberately, see `docs/BUILD_LOG.md` iteration 18 for reasoning).
+- 10 new tests, including a Luhn-invalid number correctly *not* being
+  flagged as a credit card.
+- Full regression: `mypy --strict` clean (33 files), 55/55 tests.
+- Not yet wired into `orchestrator.py` — needs `decisions.py` to exist
+  first to decide what action a match produces. Full detail:
+  `docs/BUILD_LOG.md` iteration 18.
+
+## Week 5, Day 1 (continued) — L2 tool-result scan built
+
+- `guardrails/tool_result_scan.py`: `scan_tool_result(tool, result)` —
+  thin wrapper over the same shared `patterns.py`, proving the L1/L2
+  shared-module bet paid off (no new detection logic needed). Plus
+  `wrap_untrusted(tool, content)` — the delimiter template, applied
+  unconditionally to every tool result regardless of scan outcome
+  (structural hygiene, not a `GuardAction`).
+- 5 new tests: catches the indirect-injection example from the earlier
+  walkthrough, redacts PII in tool output, delimiter wraps even clean
+  content.
+- Full regression: `mypy --strict` clean (34 files), 39/39 unit tests.
+- Still not wired into the orchestrator — same reason as L1, needs
+  `decisions.py`. L1+L2 detection is now fully done; L3+L4+`decisions.py`
+  + orchestrator wiring are next, together.
+
+## Week 5, Day 1 (continued) — L3 + L4 detection built
+
+- `registry.py`: `Tool` gained `args_model` (the Pydantic model it was
+  already building internally, now kept instead of discarded) — lets
+  L3 validate a live call's arguments without a new `jsonschema`
+  dependency.
+- `guardrails/output_validate.py`: `validate_output(tool_call, tools,
+  policy_caps=None)` — allowlist, schema, policy bounds (config, not a
+  hardcoded ₹ constant), PII-in-model-output. All four of spec's L3
+  checks.
+- `guardrails/run_level.py`: `detect_loop` (same tool+args N times →
+  flag) and `detect_escalation` (N guardrail hits this run → force
+  approval regardless). Both pure over `RunState`.
+- 11 new tests. Full regression: `mypy --strict` clean (36 files),
+  71/71 tests (unit + integration + chaos all green).
+- **All four guardrail layers are now built and tested standalone.**
+  Nothing wired into `orchestrator.py` yet — that's the last piece:
+  `decisions.py` (your file) + the actual hook points + `GuardrailTriggered`
+  events. Full detail: `docs/BUILD_LOG.md` iteration 20.
+
+## Week 5, Day 1 (continued) — decisions.py + orchestrator wiring: guardrails are live
+
+- `guardrails/decisions.py` (write-yourself file, user explicitly asked
+  me to write it this time): `GuardrailProfile`, three named profiles
+  (strict/standard/lenient), `decide(match, profile) -> GuardrailAction`.
+  Deterministic violations always BLOCK; only confidence-based injection
+  matches vary by profile. 12 tests.
+- Orchestrator wired at 4 hook points: L1 (once, gated on `state.step
+  == 0`), L3+L4-loop (in `_request_tool_call`, before the approval
+  gate), L4-escalation (OR'd into the existing approval gate — reuses
+  Week 4's grant/deny machinery), L2 (in `_reconcile`, after tool
+  execution). New `_sanitize_for_llm`: redaction/delimiting applied
+  fresh at every LLM call, never by mutating stored history.
+- **Known cut:** L1 `ESCALATE` has no tool-call context to attach a
+  human approval request to yet — fails closed (`BLOCK`) instead of
+  parking, until that's given a real design pass.
+- **Real bug found and fixed:** a random `uuid4()`-based `refund_id`
+  occasionally welded with `amount_inr` into a string that passed the
+  Luhn check by chance, causing genuinely intermittent chaos-suite
+  failures (16/16 sometimes, 13/16 other times). Root cause: naive
+  `" ".join(...)` on tool-result fields. Fixed by scanning
+  `json.dumps(...)` instead — quotes/commas break the false adjacency.
+  2 regression tests prove both the bug and the fix.
+- 2 new orchestrator tests: a ₹5,00,000-over-cap refund gets blocked
+  before executing (the design discussion's own worked example, now a
+  real test), and 3 unrelated PII hits force approval on a refund
+  *below* the tool's own approval threshold.
+- Full regression: `mypy --strict` clean (37 files), 86/86 tests, chaos
+  suite re-run 4x clean after the fix. Full detail: `docs/BUILD_LOG.md`
+  iteration 21.
+
+**Guardrails are now fully live.** Remaining for Week 5: the attack
+corpus (50-100 labelled cases) + benign corpus, and the actual
+attack-success-rate / false-positive-rate measurement.
+
+## Week 5, Day 1 (continued) — runnable attack demo
+
+- `examples/demo_guardrail_block.py` — real Postgres store + refund
+  backend, a scripted ₹5,00,000 refund request against the ₹6,400 demo
+  order. `durable-agents replay <run_id>` shows the real
+  `GuardrailTriggered`/`RunFailed(guardrail_block)` trace.
+- New top-level `examples/` directory — same "don't ship demo code in
+  the wheel" reasoning already flagged for `refund_tools.py`. Also
+  reusable for Week 6's "Inject attack" demo-page button.
+  Full detail: `docs/BUILD_LOG.md` iteration 22.
+
+## Week 5, Day 1 (continued) — attack corpus + real eval numbers, Week 5 fully complete
+
+- `tests/guardrails/corpus.py`: 80 labelled cases (10 per threat
+  category × 6 + 20 benign, several benign ones deliberately
+  suspicious-looking). Found `tests/guardrails/`/`live/`/`property/`
+  already existed as empty Week-1 scaffolding — this is where it
+  belonged.
+- `tests/guardrails/test_corpus_eval.py`: measures the detection+
+  decision layer directly (design choice confirmed with user first).
+  Real numbers:
+
+  | Profile | Attack success rate | False positive rate |
+  |---|---|---|
+  | strict | 0% | 25% |
+  | standard (financial_v1) | 0% | 20% |
+  | lenient | 25% | 5% |
+
+- First run: 52/60 caught (13% success). 8 misses were pure detection
+  gaps (phrasings matching nothing at all) — added 6 generalized
+  patterns, re-ran: 60/60 under standard/strict.
+- 20% false-positive rate under standard was investigated, not tuned
+  away — `bn-07` gets BLOCKed because "disregard the previous..." is
+  genuinely ambiguous (common innocent correction AND common attack
+  opener). Documented honestly rather than weakened, since weakening it
+  would let a real attack through too.
+- Full regression: `mypy --strict` clean (44 files), 88/88 tests, chaos
+  re-verified 2x clean. Full detail: `docs/BUILD_LOG.md` iteration 23.
+
+**Week 5 is now fully complete.** `guardrails/decisions.py` — the
+user's last write-yourself file — is written, by explicit request.
+
+## Week 6, Day 1 — error handling, retries, system prompt, logging
+
+Prompted by a full-project review. The finding no doc had recorded:
+**`LLMCallFailed` was never appended by anything**, and there was
+exactly one `try/except` in `orchestrator.py`. A 429 or a tool timeout
+crashed the process outright.
+
+- **Retry budget in the event log**, not a local variable —
+  `InFlightOp.attempts`, incremented by `LLMCallFailed`/`ToolCallFailed`.
+  A resumed process inherits what a dead one spent; a local counter
+  would reset on every crash and retry forever.
+- **Tool retries reuse the original idempotency key.** This closed a
+  real exactly-once hole: surfacing a tool error to the model made it
+  issue a fresh call at a new seq — a *new* key nothing would
+  deduplicate, i.e. a double charge. `ToolCallFailed.final_attempt`
+  (default `True`, so old rows rebuild identically) distinguishes
+  "retrying in place" from "budget spent, tell the model."
+- **System prompt now exists.** `RunStarted.system_prompt` stored in
+  full; `system_prompt_hash` derived from it rather than hand-supplied
+  so they can't disagree (and old rows keep their stored hash).
+  Threaded through `RunState` into `LLMClient.call()`. Previously the
+  log had been fingerprinting a prompt that didn't exist for 5 weeks,
+  and the agent couldn't be steered at all.
+- **Logging** via `logging.getLogger(__name__)`, no handler attached.
+- **Two bugs the logging immediately exposed:** `recovered` was
+  meaninglessly always-`True` for LLM ops (`_requested_this_run` only
+  tracked tool seqs); and `replay` crashed with `UnicodeEncodeError` on
+  any non-ASCII output on Windows (cp1252) — i.e. on most of the
+  world's text.
+- 8 new tests + `examples/demo_retry_recovery.py` (real Postgres, two
+  provider errors and a tool timeout, run still completes, exactly one
+  charge). Full regression: `mypy --strict` clean (45 files), 96/96
+  tests, chaos verified stable 2x. Full detail: `docs/BUILD_LOG.md`
+  iteration 24.
+
+**Still open from that review**, in priority order: empty
+`__init__.py` (no public API — `from durable_agents import ...` gives
+nothing), empty `README.md` and `DECISIONS.md`, schema not shipped in
+the wheel (`db/migrations/*.sql` is outside the packaged directory, so
+`pip install` yields something that can't create its own table), no
+in-memory `EventStore` in the package (can't try it without Docker),
+no `AnthropicClient`, no `POST /runs`, no recovery sweeper.
+
+## Week 6: Ship it
+
+Reordered after the 2026-09-02 project review. Spec's own Week 6 list
+is kept, but **the review findings are sequenced ahead of the
+demo/marketing items**, because the stated goal is real usage rather
+than a published-looking repo — and several findings mean the package
+is currently not installable-and-usable at all.
+
+The review's core conclusion: *the durable-execution engine is solid
+and unusually well-tested; the library around it does not exist yet.*
+That gap is the week's actual work.
+
+---
+
+### Phase 0 — production-correctness hardening ✅ DONE (Iteration 24)
+
+Retries + error events, tool retry reusing the idempotency key, system
+prompt, logging. Plus two bugs the logging exposed (`recovered` always
+true for LLM ops; `replay` crashing on non-ASCII on Windows). See the
+Week 6 Day 1 entry above.
+
+---
+
+### Phase 1 — make it an actual library ✅ DONE (Iteration 25)
+
+All six items closed, plus two packaging bugs found along the way.
+
+- **`Runtime` facade built** (`runtime.py`): `create()` records,
+  `start()` records+executes, `resume()`, `get_state()`. Tools supplied
+  once at construction rather than per-`start()` as spec shows —
+  nothing in the log records which tools were registered, so per-run
+  tools would let a resume run against a different set than produced
+  the events.
+- **Public API**: 47 exports with explicit `__all__`; a test asserts
+  every advertised name resolves.
+- **Schema ships**: `storage/schema.sql` inside the package,
+  `create_schema(dsn)` + `schema_sql()` + `durable-agents init-db`.
+  Verified by building the wheel and listing its contents.
+- **`InMemoryEventStore` ships** (`storage/memory.py`), mirroring
+  Postgres's `ConcurrencyConflict` semantics.
+- **README written** — including an Honest limits section and a
+  comparison table that says when to use Temporal instead. Its example
+  is executed by the test suite so it can't rot.
+- **`DECISIONS.md` populated** from the real forks across 24
+  iterations, with rejected alternatives and open questions.
+- **Two packaging bugs fixed**: there was no console-script entry point
+  at all (every doc saying `durable-agents replay …` was wrong), and
+  `fastapi` was a hard runtime dep despite the runtime never importing
+  it (now an optional `api` extra). Added license/keywords/classifiers.
+- 9 new tests importing only from the top-level package. Full
+  regression: `mypy --strict` clean (49 files), 105/105 tests. README
+  quickstart run verbatim through the installed console script.
+  Full detail: `docs/BUILD_LOG.md` iteration 25.
+
+<details>
+<summary>Original Phase 1 item list (all closed)</summary>
+
+Right now `pip install durable-agents` produces something a stranger
+cannot use. Every item here is a hard blocker:
+
+1. **Public API in `src/durable_agents/__init__.py`** — currently
+   empty, so `from durable_agents import ...` yields nothing and every
+   consumer must import internal module paths
+   (`durable_agents.storage.postgres`, `durable_agents.tools.registry`,
+   …). Decide and export the real surface: `tool`, `Orchestrator` (or a
+   friendlier `Runtime` facade), `EventStore`/`PostgresEventStore`,
+   `LLMClient`/`LLMResponse`, `RunState`, the guardrail profiles.
+   Set `__all__`.
+2. **Ship the schema.** `db/migrations/*.sql` lives outside
+   `src/durable_agents`, which is the only packaged directory — so the
+   wheel contains no way to create the `events` table, and there is no
+   migration runner anywhere. Move the SQL inside the package as data
+   files and expose `create_schema(dsn)` plus a
+   `durable-agents init-db` CLI command.
+3. **Ship an in-memory `EventStore`.** It exists only inside two test
+   files today, so nobody can try the library without standing up
+   Docker + Postgres first. Most evaluators quit at that step.
+4. **Write `README.md`** — currently 0 bytes, so the PyPI page would be
+   blank. Needs: the problem in three sentences, a genuinely
+   copy-pasteable working example, install + `init-db`, honest limits,
+   and the comparison table below.
+5. **Reconcile the "five-line example" with reality.** Spec section 17
+   advertises `Runtime`, `PostgresStore`, `GuardrailProfile.financial()`
+   — none of which exist under those names or shapes. Either build that
+   facade or rewrite the promise. Do not publish a README whose
+   headline example doesn't run.
+6. **`DECISIONS.md`** is also 0 bytes despite `BUILD_LOG.md`
+   advertising it as the "why this over the alternative" companion.
+   Either populate it from the decisions already recorded across
+   iterations, or drop the reference.
+
+</details>
+
+---
+
+### Phase 2 — make it run a real agent (NEXT)
+
+7. **`AnthropicClient`** (deferred twice — silently in Week 2, then
+   explicitly in Week 5). Until this exists the runtime can only replay
+   one fixed scripted scenario; it cannot be pointed at a real model.
+   Note the burden this puts on third-party implementers:
+   `LLMResponse` demands `cost_usd: Decimal` and `provider_request_id`,
+   which a custom provider may have to fabricate — worth revisiting
+   while writing the first real implementation.
+8. **Live-tests tier** — `@pytest.mark.live`, `skipif` without an API
+   key so a fresh clone still runs green, hard cost cap, tools always
+   fake, never in CI on every push.
+9. **`POST /runs`** — the API can read status and approve/deny, but
+   cannot *start* a run. Today that only works via CLI or direct Python
+   calls, which makes the HTTP surface incomplete for any real
+   deployment.
+10. **L1 classifier sub-layer** (unblocked once (7) lands) — the
+    "is this text trying to manipulate an AI system?" check that
+    pattern matching structurally cannot do. Optional, off by default,
+    cached by input hash.
+
+---
+
+### Phase 3 — make it self-healing (the actual production story)
+
+11. **Recovery sweeper** — a periodic job running the dangling-
+    `Requested` query and re-enqueueing orphaned runs. This is what
+    turns crash-resume from a manual CLI command into an automatic
+    property of the system, and it is the single most quotable thing in
+    the whole project ("a pod dies, a minute later something else picks
+    the run up"). Not built at all.
+12. **Dockerfile + deploy** — API + worker + sweeper as three
+    processes, per spec's own architecture.
+
+---
+
+### Phase 4 — make it findable and understandable
+
+13. **Demo page** with kill and inject-attack buttons, SSE streaming.
+    `examples/demo_guardrail_block.py` and
+    `examples/demo_retry_recovery.py` are head starts on two of the
+    buttons.
+14. **`replay` polish** — cost/duration/guardrail rollup summary.
+    `_event_detail` already formats every event type, so this is
+    aggregation, not new formatting.
+15. **Comparison table** — vs Temporal, Restate, DBOS, LangGraph
+    checkpointers. Scrupulously fair, including where this is worse
+    (single language, no distributed workers, Postgres-only). Needs a
+    real answer to "why not Temporal", not just "simpler".
+16. **GIF, two-minute video, blog post, PyPI publish.** Publish *after*
+    Phase 1, not before — an empty-README package with no public API is
+    worse than no package.
+
+---
+
+### Packaging cleanup (before any publish)
+
+17. Move `tools/refund_tools.py`, `tools/refund_demo_scenario.py`, and
+    `tools/refund_backend_postgres.py` out of `src/durable_agents/` —
+    demo application code that shouldn't ship in the wheel. `examples/`
+    now exists as a natural destination. `tools/registry.py` (the
+    generic decorator) stays.
+18. Decide whether `002_refund_ledger.sql` ships at all — it's demo
+    schema, not runtime schema.
+
+---
+
+### Open design questions the review raised (decide, don't drift)
+
+- **Incremental adoption.** The current API demands a consumer hand
+  over their entire agent loop: implement `LLMClient`, re-declare every
+  tool through `@tool`, restructure control flow around
+  `Orchestrator.run()`, run Postgres. Everyone who wants this already
+  has a working agent loop, and all-or-nothing migration is the main
+  reason agent frameworks get starred and never used. A wrapper API
+  (`async with runtime.run(...) as run: await run.llm_call(...)` /
+  `await run.tool_call(...)`) would allow adopting durability
+  incrementally against an existing loop. Potentially the single
+  highest-leverage change for real usage; needs a real decision.
+- **Guardrail positioning.** Regex-based prompt-injection detection is
+  not credible as a headline feature — the eval's own honest 20%
+  false-positive rate shows why. Consider demoting guardrails to an
+  optional module so they don't undercut the durability work, which is
+  the genuinely differentiated part.
+- **Spec bias.** `docs/SPEC.md` optimizes for *appearing* shipped
+  ("nobody checks download counts; installability is the signal";
+  "worth being able to say in an interview") and defers every adoption
+  task to this final week. That trade-off is worth making explicitly
+  now that the stated goal is real users.
+- **Known correctness gap, still open:** step/cost caps are checked
+  *before* the in-flight check in `run()`'s loop, so a run can hit its
+  cap while a tool call is genuinely dangling, leaving that side effect
+  unresolved (flagged back in Iteration 12).
+- **L1 `ESCALATE` fails closed** (BLOCK) because there's no tool call
+  in context to attach an `ApprovalRequested` to. Needs either a schema
+  change or a deliberate decision to keep failing closed.

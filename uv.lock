@@ -323,13 +323,18 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "asyncpg" },
-    { name = "fastapi" },
     { name = "pydantic" },
+]
+
+[package.optional-dependencies]
+api = [
+    { name = "fastapi" },
 ]
 
 [package.dev-dependencies]
 dev = [
     { name = "asyncpg-stubs" },
+    { name = "fastapi" },
     { name = "httpx" },
     { name = "mypy" },
     { name = "pytest" },
@@ -340,13 +345,15 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "asyncpg" },
-    { name = "fastapi", specifier = ">=0.141.1" },
+    { name = "fastapi", marker = "extra == 'api'", specifier = ">=0.115" },
     { name = "pydantic", specifier = ">=2" },
 ]
+provides-extras = ["api"]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "asyncpg-stubs" },
+    { name = "fastapi", specifier = ">=0.115" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "mypy" },
     { name = "pytest" },

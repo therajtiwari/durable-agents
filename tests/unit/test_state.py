@@ -95,6 +95,11 @@ def test_empty_log_yields_not_started() -> None:
     assert state.messages == []
 
 
+def test_guardrail_profile_carries_through_from_run_started() -> None:
+    state = rebuild_state(_build_events())
+    assert state.guardrail_profile == "financial_v1"
+
+
 def test_dangling_llm_request_becomes_in_flight() -> None:
     events = _build_events()[:2]  # RunStarted, LLMCallRequested — no Completed yet
     state = rebuild_state(events)

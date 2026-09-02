@@ -8,11 +8,26 @@ version = "0.1.0"
 description = "An event-sourced runtime for durable, crash-resumable LLM agents"
 readme = "README.md"
 requires-python = ">=3.12"
+license = "MIT"
+keywords = ["llm", "agents", "durable-execution", "event-sourcing", "postgres"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Typing :: Typed",
+]
 dependencies = [
     "pydantic>=2",
     "asyncpg",
-    "fastapi>=0.141.1",
 ]
+
+[project.optional-dependencies]
+# The HTTP approve/deny/status endpoints. Optional because the runtime
+# itself never imports FastAPI — only durable_agents.api.app does, and
+# plenty of users will drive runs from their own application instead.
+api = ["fastapi>=0.115"]
 
 [dependency-groups]
 dev = [
@@ -22,7 +37,11 @@ dev = [
     "mypy",
     "asyncpg-stubs",
     "httpx>=0.28.1",
+    "fastapi>=0.115",
 ]
+
+[project.scripts]
+durable-agents = "durable_agents.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/durable_agents"]

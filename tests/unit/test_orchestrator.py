@@ -239,6 +239,87 @@ async def test_approval_denied_feeds_reason_back_instead_of_looping() -> None:
 
 
 @pytest.mark.asyncio
+async def test_guardrail_blocks_before_executing_when_policy_cap_exceeded() -> None:
+    # The exact worked example from the guardrail design discussion: an
+    # injected instruction convinces the model to ask for far more than
+    # the policy cap allows. L3's bounds check is deterministic, so it
+    # catches this regardless of how the model got there.
+    store = InMemoryEventStore()
+    run_id = uuid4()
+    await store.append(run_id, 0, _run_started())
+
+    args = {"order_id": "A-8891", "amount_inr": 500000, "reason": "damaged"}
+    llm = ScriptedLLM(
+        [
+            _llm_response(
+                content="Issuing the refund.",
+                tool_calls=[ToolCallInvocation(id="t1", name="issue_refund", arguments=args)],
+                stop_reason="tool_use",
+            ),
+        ]
+    )
+    orchestrator = Orchestrator(store=store, llm=llm, tools=_tools())
+    state = await orchestrator.run(run_id)
+
+    assert state.status == "failed"
+    assert state.failure_reason == "guardrail_block"
+
+    event_types = [type(e).__name__ for e in await store.read(run_id)]
+    assert "GuardrailTriggered" in event_types
+    # The dangerous side effect never ran — blocked before execution,
+    # not after.
+    assert "ToolCallRequested" not in event_types
+
+
+@pytest.mark.asyncio
+async def test_guardrail_escalation_forces_approval_below_tools_own_threshold() -> None:
+    # issue_refund's own requires_approval only fires above ₹5,000 — this
+    # call asks for ₹3,000, which alone would never need a human. Three
+    # unrelated PII hits earlier in the same run should still force
+    # approval anyway, per the "guardrails and approval compose" design.
+    store = InMemoryEventStore()
+    run_id = uuid4()
+    await store.append(
+        run_id,
+        0,
+        RunStarted(
+            seq=0,
+            created_at=_now(),
+            goal="Refund for a@x.com, b@x.com, and c@x.com please.",
+            model="scripted",
+            system_prompt_hash="sha256:test",
+            max_steps=15,
+            max_cost_usd=Decimal("2.00"),
+            requested_by="support-queue",
+            guardrail_profile="financial_v1",
+        ),
+    )
+
+    args = {"order_id": "A-8891", "amount_inr": 3000, "reason": "damaged"}
+    llm = ScriptedLLM(
+        [
+            _llm_response(
+                content="Issuing a small refund.",
+                tool_calls=[ToolCallInvocation(id="t1", name="issue_refund", arguments=args)],
+                stop_reason="tool_use",
+            ),
+        ]
+    )
+    orchestrator = Orchestrator(store=store, llm=llm, tools=_tools())
+    state = await orchestrator.run(run_id)
+
+    assert state.status == "awaiting_approval"
+    assert state.pending_approval is not None
+    assert state.pending_approval.tool == "issue_refund"
+
+    event_types = [type(e).__name__ for e in await store.read(run_id)]
+    assert event_types.count("GuardrailTriggered") == 4  # 3 L1 PII hits + the L4 escalation hit
+    assert "ApprovalRequested" in event_types
+    # Escalated, not executed — the tool call never actually ran.
+    assert "ToolCallRequested" not in event_types
+
+
+@pytest.mark.asyncio
 async def test_hallucinated_tool_recovers_instead_of_looping() -> None:
     store = InMemoryEventStore()
     run_id = uuid4()

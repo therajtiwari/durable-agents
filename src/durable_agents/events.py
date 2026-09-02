@@ -1,8 +1,18 @@
+import hashlib
 from datetime import datetime
 from decimal import Decimal
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+
+def hash_system_prompt(system_prompt: str) -> str:
+    """Stable fingerprint for a system prompt, so "were these two runs
+    using the same instructions?" is a cheap comparison instead of a
+    full-text diff.
+    """
+
+    return "sha256:" + hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()
 
 GuardrailLayer = Literal["L1_input", "L2_tool_result", "L3_output", "L4_run_level"]
 GuardrailAction = Literal["ALLOW", "REDACT", "ESCALATE", "BLOCK"]
@@ -26,11 +36,28 @@ class RunStarted(BaseEvent):
     type: Literal["RunStarted"] = "RunStarted"
     goal: str
     model: str
-    system_prompt_hash: str
+    system_prompt: str = ""
+    """The instructions the agent runs under. Stored in full, not just
+    hashed: a replay that can't reproduce what the model was actually
+    told isn't a replay of anything. Defaults empty so events written
+    before this field existed still load.
+    """
+    system_prompt_hash: str = ""
     max_steps: int
     max_cost_usd: Decimal
     requested_by: str
     guardrail_profile: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def _derive_prompt_hash(cls, data: Any) -> Any:
+        # Derived rather than supplied, so the hash and the prompt can
+        # never disagree. Only fills a hash that isn't already present,
+        # which keeps rows written before system_prompt existed loading
+        # with the hash they were actually stored with.
+        if isinstance(data, dict) and not data.get("system_prompt_hash"):
+            data = {**data, "system_prompt_hash": hash_system_prompt(data.get("system_prompt") or "")}
+        return data
 
 
 class LLMCallRequested(BaseEvent):
@@ -89,6 +116,14 @@ class ToolCallFailed(BaseEvent):
     idempotency_key: str
     error: str
     attempt: int
+    final_attempt: bool = True
+    """False when the orchestrator intends to retry this exact call again
+    (same idempotency_key), so the operation stays in flight. True when
+    the attempt budget is spent and the error should be surfaced to the
+    model instead. Defaults True so events written before retries
+    existed — all of which were terminal unknown-tool failures — still
+    rebuild correctly.
+    """
 
 
 class GuardrailTriggered(BaseEvent):
