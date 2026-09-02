@@ -176,11 +176,47 @@ rather than worked around with a pass-through method.
 **`fastapi` is an optional extra, not a hard dependency.** The runtime
 never imports it; only `durable_agents.api.app` does.
 
+**`POST /runs` records only — it does not execute.** Rejected: blocking
+the HTTP request until the run completes or parks (mirroring
+`Runtime.start()` instead of `create()`). An agent run can take
+minutes; holding an HTTP connection open that long is fragile against
+timeouts, load balancers, and client retries. It also would have
+required the API layer to own an `LLMClient` and tool registry — a real
+architecture change from today's store-only `create_app(store)` — for
+a shape that contradicts the rest of the surface anyway, since
+`approve`/`deny` already only record decisions and leave execution to
+whatever process calls `resume()`. Defaults (`model`, `max_steps`,
+`max_cost_usd`, `guardrail_profile`) are `create_app()` keyword
+arguments rather than hardcoded, so a deployment configures its own
+policy without touching the endpoint's code.
+
 **`system_prompt_hash` is derived from `system_prompt`, not supplied.**
 Rejected: two independent fields. They could disagree, and for five
 weeks the log recorded a hash of a prompt that didn't exist anywhere.
 The validator only fills a hash that's absent, so events written before
 the field existed keep the hash they were stored with.
+
+**`durable-agents demo` and `durable-agents resume` are two different
+commands, not one.** They used to be the same command (`start`/`resume`
+both called one shared `_start_or_resume`) which *always* wired up a
+hardcoded scripted refund conversation against fake refund tools —
+discovered as a real point of confusion when a user created a run with
+an arbitrary goal via `POST /runs` and then ran `resume` on it,
+expecting their own goal to run, and got refund behavior instead. The
+CLI had silently ignored the run's own recorded goal and replayed its
+one fixed demo script regardless of which `run_id` it was given.
+
+Split: `demo` keeps the exact old zero-setup behavior (fixed script,
+fake tools, no API key, no network) for proving crash-resume works with
+nothing configured. `resume` is now generic — a real `LLMClient`
+(`OpenAICompatibleClient`, configured via `LLM_API_KEY`/`LLM_BASE_URL`/
+`LLM_MODEL`, same convention as `tests/live`) and **no tools at all**,
+since the CLI has no way to know what functions a specific deployment
+wants wired up for an arbitrary run. Rejected: giving `resume` a way to
+load tools from a config file or module path — real feature, more
+surface area than this fix needed; a run that needs tools gets a real
+script against `Runtime`/`Orchestrator` instead (already how every
+`examples/live_*.py` script works).
 
 ---
 

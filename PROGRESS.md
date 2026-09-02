@@ -670,17 +670,94 @@ cannot use. Every item here is a hard blocker:
    `AnthropicClient` remains buildable later against the same
    `LLMClient` interface if wanted. Full detail: `docs/BUILD_LOG.md`
    iteration 26.
-8. **Live-tests tier** — `@pytest.mark.live`, `skipif` without an API
-   key so a fresh clone still runs green, hard cost cap, tools always
-   fake, never in CI on every push.
-9. **`POST /runs`** — the API can read status and approve/deny, but
-   cannot *start* a run. Today that only works via CLI or direct Python
-   calls, which makes the HTTP surface incomplete for any real
-   deployment.
+8. **Live-tests tier** ✅ DONE (Iteration 27) — `tests/live/test_live_llm.py`,
+   2 tests (a bare completion, a full `Runtime`+tool-calling round
+   trip), asserting invariants not exact wording since a real model's
+   phrasing varies. `pyproject.toml` gained `markers = ["live: ..."]`
+   and `addopts = "-m 'not live'"`, so a bare `pytest` (including CI on
+   every push) never runs this tier; `pytest -m live tests/live` opts
+   in. Reads `LLM_API_KEY`/`LLM_BASE_URL`/`LLM_MODEL` generically rather
+   than a provider-specific name, same reasoning as `OpenAICompatibleClient`
+   itself. Built after chasing down a real bug first: httpx's `base_url`
+   + relative-path merging inserts no separator, so
+   `"https://host/v1"` + `"/chat/completions"` silently became
+   `"https://host/v1chat/completions"` — a genuine 404 against Groq that
+   no mocked test had caught, since a mock doesn't care what path it
+   was asked for. Fixed, plus stopped discarding the error response
+   body on a failed request (a bare 404 vs. a decommissioned-model 404
+   look identical without it). Two new example scripts along the way:
+   `live_offboarding.py` (real model choosing the tool sequence, a
+   vendor retry with the same idempotency key, approval parking, resume
+   from a fresh process) and `live_incident_triage.py` (a task built so
+   the *obvious* answer is wrong — correctly solved by
+   `openai/gpt-oss-120b`, which also surfaced a real `detect_loop` false
+   positive on a legitimate read-only verification call, logged and
+   fixed right after — see Iteration 28 below). `replay`'s output was
+   also rewritten twice at the user's
+   request along the way: step-grouped, no truncation, no emoji, no
+   fixed colours. Verified three ways: default `pytest` deselects the
+   live tests (115/115 non-live pass), `pytest -m live` with no key
+   skips them cleanly, and with a real `LLM_API_KEY` against Groq both
+   pass for real (`2 passed in 1.98s`). Full detail: `docs/BUILD_LOG.md`
+   iteration 27.
+
+**Guardrail fix, same day (Iteration 28): `detect_loop` false positive
+on read-only calls.** The gap logged above, fixed on request:
+`detect_loop` now only fires for tools with `side_effect=True` — a
+repeated read-only call (checking status again, verifying a fix) is
+normal investigative behavior, not a stuck agent, and step/cost caps
+already bound plain wasted effort regardless. Considered and rejected:
+resetting the counter after any side-effecting call in between —
+wouldn't have caught this exact case, since the repeats spanned the fix
+itself. Also fixed a real, previously-uncaught mypy gap found while
+touching this: `mypy --strict src tests` had never actually been run in
+one shot since Iteration 27 added a second `conftest.py` — the two
+collided as the same bare module name. Fixed via `explicit_package_bases`
++ an explicit `mypy_path` covering the two test directories that rely
+on pytest's own bare-import behavior at runtime. 2 new tests + 1
+renamed for clarity. Full regression: `mypy --strict src tests` clean
+in one invocation (54 files, first time), 117/117 non-live tests, 2
+deselected as designed. Full detail: `docs/BUILD_LOG.md` iteration 28.
+
+9. **`POST /runs`** ✅ DONE (Iteration 29) — records only (a design
+   choice confirmed first: matches `approve`/`deny`'s existing
+   record-only shape, avoids blocking an HTTP request for a
+   multi-minute agent run, and avoids coupling the API layer to an
+   `LLMClient`/tool registry). `create_app()` gained 4 keyword-only
+   defaults (model, max_steps, max_cost_usd, guardrail_profile) so a
+   deployment configures policy without touching endpoint code. 3 new
+   tests. Full regression: `mypy --strict` clean, 120/120 non-live
+   tests, 2 deselected as designed. **Phase 2 is now fully complete**
+   except the optional L1 classifier below. Full detail:
+   `docs/BUILD_LOG.md` iteration 29.
 10. **L1 classifier sub-layer** (unblocked now that item 1 above is done) — the
     "is this text trying to manipulate an AI system?" check that
     pattern matching structurally cannot do. Optional, off by default,
     cached by input hash.
+
+**Post-Phase-2 hardening (Iteration 30): actually running the API found
+three real problems.** Went and ran `run_api_server.py` against real
+Postgres and curled every endpoint by hand rather than trusting tests
+alone. (1) `POST /runs` 500'd immediately — asyncpg's connection pool
+was built in one event loop then handed to `uvicorn.run()`'s own,
+separate loop; fixed by driving `uvicorn.Server(...).serve()` directly
+so pool creation and every request share one loop for the process's
+lifetime. (2) Starting a run through the `/docs` Swagger page without
+editing its pre-filled `max_steps`/`max_cost_usd` (both default to
+`0`) silently recorded a run that would fail instantly on resume — not
+a code bug, but a real trap worth remembering for the eventual demo
+page. (3) The actual design gap: resuming a run created via the API
+with an arbitrary goal produced *refund* behavior — `resume` had always
+hardcoded the Week 1-3 demo's scripted conversation and fake tools
+regardless of the run's own recorded goal. Split into `durable-agents
+demo [run_id]` (the exact old zero-setup behavior, unchanged) and
+`durable-agents resume <run_id>` (now genuinely generic — a real
+`OpenAICompatibleClient` via `LLM_API_KEY`/`LLM_BASE_URL`/`LLM_MODEL`,
+no tools, since the CLI can't know what functions a given deployment
+wants wired up; missing the key fails immediately with a clear
+message). Verified by hand both ways. Full regression: `mypy --strict`
+clean (63 files), 120/120 non-live tests. Full detail:
+`docs/BUILD_LOG.md` iteration 30.
 
 ---
 

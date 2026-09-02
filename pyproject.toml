@@ -27,7 +27,7 @@ dependencies = [
 # The HTTP approve/deny/status endpoints. Optional because the runtime
 # itself never imports FastAPI — only durable_agents.api.app does, and
 # plenty of users will drive runs from their own application instead.
-api = ["fastapi>=0.115"]
+api = ["fastapi>=0.115", "uvicorn>=0.30"]
 # OpenAICompatibleClient — only needed if you use the built-in reference
 # LLM client. Anyone implementing their own LLMClient (or using
 # ScriptedLLM) never touches httpx.
@@ -42,6 +42,7 @@ dev = [
     "asyncpg-stubs",
     "httpx>=0.28.1",
     "fastapi>=0.115",
+    "uvicorn>=0.30",
 ]
 
 [project.scripts]
@@ -52,6 +53,25 @@ packages = ["src/durable_agents"]
 
 [tool.mypy]
 strict = true
+# explicit_package_bases (+ these extra roots) lets mypy tell apart
+# tests/integration/conftest.py from tests/live/conftest.py — without
+# it, two conftest.py files with no __init__.py collide as the same
+# top-level module name. The extra roots are needed because pytest's
+# own "rootless" import mode inserts each test directory onto sys.path
+# at runtime, which is what lets tests/guardrails/test_corpus_eval.py
+# and tests/live/test_live_llm.py import their sibling "corpus"/
+# "conftest" modules with a bare `from corpus import ...` — mypy needs
+# telling separately since it doesn't replicate that runtime behavior.
+mypy_path = "src:tests/guardrails:tests/live"
+explicit_package_bases = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "strict"
+markers = [
+    "live: hits a real LLM provider over the network; costs real API quota. Never runs by default — explicitly with `pytest -m live tests/live`.",
+]
+# Excludes tests/live from every ordinary run, including CI on every
+# push. The addopts default and an explicit `-m live` combine correctly:
+# pytest keeps only the LAST -m it's given, so `pytest -m live ...`
+# overrides this default rather than conflicting with it.
+addopts = "-m 'not live'"

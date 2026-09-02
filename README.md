@@ -123,6 +123,27 @@ output validation, run-level loop/escalation detection — each emitting
 [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md), including the honest
 measured numbers and where they're weak.
 
+**An HTTP API, optionally** (`pip install durable-agents[api]`):
+
+```python
+from durable_agents.api.app import create_app
+
+app = create_app(store, default_max_steps=15, default_guardrail_profile="standard")
+```
+
+| | |
+|---|---|
+| `POST /runs` | Start a run — `{"goal": "...", "requested_by": "..."}`. Records only, like `Runtime.create()`; doesn't block on execution. |
+| `GET /runs/{id}` | Current status, pending approval, final answer. |
+| `POST /runs/{id}/approve` | `{"approver": "..."}` |
+| `POST /runs/{id}/deny` | `{"approver": "...", "reason": "..."}` |
+
+Every mutating endpoint only *records* — same reasoning as
+`Runtime.create()` vs `start()`: an agent run can take minutes, and
+blocking an HTTP request for that is fragile against timeouts and load
+balancers. Something else (a worker, `resume()` in a loop, the
+eventual recovery sweeper) does the actual executing.
+
 ---
 
 ## Try it in 30 seconds
@@ -233,14 +254,50 @@ server you use. Retries are the orchestrator's job (see Iteration 24 in
 `docs/BUILD_LOG.md`), so this client doesn't retry internally — it
 raises, and the runtime's own backoff takes it from there.
 
+### Testing against a real provider
+
+The automated test suite (`pytest`) never touches a network — every
+test above uses `ScriptedLLM` or a mocked HTTP transport, on purpose,
+so `pip install -e .[dev]` and `pytest` stays free, fast, and
+deterministic for anyone who clones this repo.
+
+A second tier exists specifically to catch what a mock can't: whether
+the wire format actually holds up against a real server. It's opt-in
+only, and skips cleanly if you haven't set a key:
+
+```bash
+$env:LLM_API_KEY = "gsk_..."          # a free Groq key works
+pytest -m live tests/live -v
+```
+
+`pytest` alone (no `-m`) never runs these — the default excludes the
+`live` marker, so a normal test run and CI never spend API quota by
+accident. Configure `LLM_BASE_URL`/`LLM_MODEL` the same way as the
+client above if you're not using Groq.
+
+Three example scripts under `examples/` go further, exercising the
+whole runtime — retries, approval parking, resuming from a fresh
+process — against a real model:
+
+- `examples/live_smoke_test.py` — the minimal single-tool case
+- `examples/live_offboarding.py` — multi-step tool chaining, a vendor
+  call that fails once and is retried with the same idempotency key,
+  and a destructive step that parks for approval
+- `examples/live_incident_triage.py` — a task deliberately built so the
+  *obvious* answer is wrong, to see whether the model's reasoning (not
+  a script) actually gets it right
+
 ---
 
 ## Honest limits
 
 Read this part before adopting.
 
-- **No real provider client ships yet.** `ScriptedLLM` is included;
-  `AnthropicClient` is not written. You supply your own `LLMClient`.
+- **One real provider client, generically.** `OpenAICompatibleClient`
+  ships and is verified against a real provider (see "Testing against a
+  real provider" above) — but there's no dedicated `AnthropicClient` or
+  official SDK wrapper for any vendor. If your provider doesn't speak
+  the OpenAI wire format, you supply your own `LLMClient`.
 - **Postgres or in-memory only.** No SQLite, MySQL, or Redis store.
 - **Async only**, Python 3.12+.
 - **Single-process execution per run.** Safe under concurrent workers,

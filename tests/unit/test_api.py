@@ -89,6 +89,71 @@ def _park_on_approval(store: InMemoryEventStore, run_id: UUID) -> None:
         asyncio.run(store.append(run_id, i, event))
 
 
+def test_start_run_records_without_executing() -> None:
+    store = InMemoryEventStore()
+    client = TestClient(create_app(store))
+
+    response = client.post(
+        "/runs", json={"goal": "Refund order A-8891.", "requested_by": "hr-system"}
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["status"] == "running"
+    assert body["step"] == 0
+    run_id = UUID(body["run_id"])
+
+    events = asyncio.run(store.read(run_id))
+    assert len(events) == 1
+    assert isinstance(events[0], RunStarted)
+    assert events[0].goal == "Refund order A-8891."
+
+    # And GET on that same id reflects the exact same state — no
+    # separate source of truth between the POST response and a re-fetch.
+    status = client.get(f"/runs/{run_id}").json()
+    assert status == body
+
+
+def test_start_run_applies_configured_defaults() -> None:
+    store = InMemoryEventStore()
+    client = TestClient(
+        create_app(
+            store,
+            default_model="llama-70b",
+            default_max_steps=10,
+            default_max_cost_usd=Decimal("0.25"),
+            default_guardrail_profile="strict",
+        )
+    )
+
+    response = client.post("/runs", json={"goal": "g"})
+    run_id = UUID(response.json()["run_id"])
+
+    events = asyncio.run(store.read(run_id))
+    started = events[0]
+    assert isinstance(started, RunStarted)
+    assert started.model == "llama-70b"
+    assert started.max_steps == 10
+    assert started.max_cost_usd == Decimal("0.25")
+    assert started.guardrail_profile == "strict"
+
+
+def test_start_run_per_request_overrides_beat_defaults() -> None:
+    store = InMemoryEventStore()
+    client = TestClient(create_app(store, default_max_steps=10, default_guardrail_profile="strict"))
+
+    response = client.post(
+        "/runs", json={"goal": "g", "max_steps": 99, "guardrail_profile": "lenient"}
+    )
+    run_id = UUID(response.json()["run_id"])
+
+    events = asyncio.run(store.read(run_id))
+    started = events[0]
+    assert isinstance(started, RunStarted)
+    assert started.max_steps == 99
+    assert started.guardrail_profile == "lenient"
+
+
 def test_status_unknown_run_returns_404() -> None:
     client = TestClient(create_app(InMemoryEventStore()))
     response = client.get(f"/runs/{uuid4()}")

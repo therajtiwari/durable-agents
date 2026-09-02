@@ -5,6 +5,7 @@ import sys
 from uuid import UUID, uuid4
 
 from durable_agents.events import LLMCallCompleted
+from durable_agents.llm.openai_compatible import OpenAICompatibleClient
 from durable_agents.llm.scripted import ScriptedLLM
 from durable_agents.orchestrator import Orchestrator
 from durable_agents.replay_view import Style, render, should_use_colour
@@ -31,21 +32,24 @@ async def _replay(run_id: UUID, dsn: str, *, colour: bool | None, show_thinking:
     print(render(run_id, events, rebuild_state(events), style, show_thinking))
 
 
-async def _start_or_resume(run_id: UUID, dsn: str) -> None:
-    """Shared by both start and resume — deliberately the same code path,
-    same as orchestrator.run() itself: starting is just resuming from an
-    empty log. Runs the one fixed canonical demo scenario (no real LLM
-    client exists yet — only ScriptedLLM and the fake refund backend are
-    built), reconstructing ScriptedLLM's position from how many
-    LLMCallCompleted events already exist, so calling this twice on the
-    same run_id (e.g. after a crash) picks up correctly.
+async def _demo(run_id: UUID, dsn: str) -> None:
+    """The zero-setup crash-resume proof: one fixed scripted conversation
+    against fake refund tools — no API key, no network call, nothing to
+    configure. Starting is just resuming from an empty log, same as
+    orchestrator.run() itself, so the same function handles both a fresh
+    run_id and one that already has events (e.g. was killed mid-flight)
+    — reconstructing ScriptedLLM's position from how many
+    LLMCallCompleted events already exist.
+
+    This is a fixed demo, not a way to run an arbitrary goal — see
+    `resume` for that.
     """
 
     store = await PostgresEventStore.connect(dsn)
     events = await store.read(run_id)
 
     if not events:
-        await store.append(run_id, 0, canonical_run_started(requested_by="cli"))
+        await store.append(run_id, 0, canonical_run_started(requested_by="cli-demo"))
         events = await store.read(run_id)
 
     already_completed = sum(1 for e in events if isinstance(e, LLMCallCompleted))
@@ -56,6 +60,45 @@ async def _start_or_resume(run_id: UUID, dsn: str) -> None:
 
     orchestrator = Orchestrator(store=store, llm=llm, tools=tools)
     final_state = await orchestrator.run(run_id)
+
+    print(f"Run {run_id}: {final_state.status}")
+    print(f"(see the full trace with: durable-agents replay {run_id})")
+
+
+async def _resume(run_id: UUID, dsn: str) -> None:
+    """Resume ANY run — including one created over the API with an
+    arbitrary goal — using a real LLM client.
+
+    Configured entirely through environment variables (LLM_API_KEY /
+    LLM_BASE_URL / LLM_MODEL), the same convention tests/live and the
+    examples/live_*.py scripts already use, rather than a hardcoded
+    provider — see DECISIONS.md's "Provider client" section for why.
+
+    Runs with NO tools: this command has no way to know what functions a
+    specific deployment wants wired up for a given run, so it only
+    handles pure conversational/reasoning goals. A run that needs real
+    tools needs a real script wired against Runtime/Orchestrator
+    directly — see README.md's "Bring your own model" section.
+    """
+
+    api_key = os.environ.get("LLM_API_KEY")
+    if not api_key:
+        print("Set LLM_API_KEY to resume a run with a real LLM (a free Groq key works).")
+        print("This command runs with no tools — only goals that need pure reasoning,")
+        print("no tool calls, will complete. For anything else, write a script against")
+        print("Runtime/Orchestrator directly (see README.md).")
+        sys.exit(1)
+
+    base_url = os.environ.get("LLM_BASE_URL", "https://api.groq.com/openai/v1")
+    model = os.environ.get("LLM_MODEL", "openai/gpt-oss-120b")
+
+    store = await PostgresEventStore.connect(dsn)
+    llm = OpenAICompatibleClient(base_url=base_url, model=model, api_key=api_key)
+    try:
+        orchestrator = Orchestrator(store=store, llm=llm, tools={})
+        final_state = await orchestrator.run(run_id)
+    finally:
+        await llm.aclose()
 
     print(f"Run {run_id}: {final_state.status}")
     print(f"(see the full trace with: durable-agents replay {run_id})")
@@ -96,15 +139,24 @@ def main() -> None:
         "--dsn", default=os.environ.get("DATABASE_URL", DEFAULT_DSN)
     )
 
-    start_parser = subparsers.add_parser(
-        "start", help="Start a new run of the demo refund scenario"
+    demo_parser = subparsers.add_parser(
+        "demo",
+        help="Run the zero-setup crash-resume demo (fixed scripted refund scenario)",
     )
-    start_parser.add_argument(
+    demo_parser.add_argument(
+        "run_id",
+        type=UUID,
+        nargs="?",
+        default=None,
+        help="Resume a demo run that was killed mid-flight; omit to start a new one",
+    )
+    demo_parser.add_argument(
         "--dsn", default=os.environ.get("DATABASE_URL", DEFAULT_DSN)
     )
 
     resume_parser = subparsers.add_parser(
-        "resume", help="Resume an existing run from wherever its event log left off"
+        "resume",
+        help="Resume ANY run with a real LLM (needs LLM_API_KEY; no tools wired up)",
     )
     resume_parser.add_argument("run_id", type=UUID)
     resume_parser.add_argument(
@@ -125,12 +177,13 @@ def main() -> None:
                 show_thinking=args.thinking,
             )
         )
-    elif args.command == "start":
-        run_id = uuid4()
-        print(f"Starting run {run_id}")
-        asyncio.run(_start_or_resume(run_id, args.dsn))
+    elif args.command == "demo":
+        run_id = args.run_id or uuid4()
+        if args.run_id is None:
+            print(f"Starting demo run {run_id}")
+        asyncio.run(_demo(run_id, args.dsn))
     elif args.command == "resume":
-        asyncio.run(_start_or_resume(args.run_id, args.dsn))
+        asyncio.run(_resume(args.run_id, args.dsn))
 
 
 if __name__ == "__main__":

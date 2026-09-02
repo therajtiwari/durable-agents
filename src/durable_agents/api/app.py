@@ -1,12 +1,12 @@
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
-from durable_agents.events import ApprovalDenied, ApprovalGranted
+from durable_agents.events import ApprovalDenied, ApprovalGranted, RunStarted
 from durable_agents.state import RunState, RunStatus, rebuild_state
 from durable_agents.storage.protocol import ConcurrencyConflict, EventStore
 
@@ -26,6 +26,16 @@ class RunStatusResponse(BaseModel):
     pending_approval: PendingApprovalResponse | None
     final_answer: str | None
     failure_reason: str | None
+
+
+class StartRunRequest(BaseModel):
+    goal: str
+    requested_by: str = "unknown"
+    system_prompt: str = ""
+    model: str | None = None
+    max_steps: int | None = None
+    max_cost_usd: Decimal | None = None
+    guardrail_profile: str | None = None
 
 
 class ApproveRequest(BaseModel):
@@ -70,9 +80,44 @@ def _status_response(run_id: UUID, state: RunState) -> RunStatusResponse:
     )
 
 
-def create_app(store: EventStore) -> FastAPI:
+def create_app(
+    store: EventStore,
+    *,
+    default_model: str = "unspecified",
+    default_max_steps: int = 25,
+    default_max_cost_usd: Decimal = Decimal("1.00"),
+    default_guardrail_profile: str = "standard",
+) -> FastAPI:
     app = FastAPI(title="durable-agents")
     app.state.store = store
+
+    @app.post("/runs", status_code=201, response_model=RunStatusResponse)
+    async def start_run(
+        body: StartRunRequest, store: EventStore = Depends(get_store)
+    ) -> RunStatusResponse:
+        # Records only — does not execute. An agent run can take minutes;
+        # blocking an HTTP request for that is fragile against timeouts,
+        # load balancers, and retries, and matches how approve/deny
+        # already work here (they record a decision, a separate process
+        # does the resuming). This mirrors Runtime.create(), not
+        # Runtime.start() — see DECISIONS.md's "API surface" section for
+        # the reasoning.
+        run_id = uuid4()
+        started = RunStarted(
+            seq=0,
+            created_at=datetime.now(timezone.utc),
+            goal=body.goal,
+            model=body.model or default_model,
+            system_prompt=body.system_prompt,
+            max_steps=body.max_steps if body.max_steps is not None else default_max_steps,
+            max_cost_usd=(
+                body.max_cost_usd if body.max_cost_usd is not None else default_max_cost_usd
+            ),
+            requested_by=body.requested_by,
+            guardrail_profile=body.guardrail_profile or default_guardrail_profile,
+        )
+        await store.append(run_id, 0, started)
+        return _status_response(run_id, rebuild_state([started]))
 
     @app.get("/runs/{run_id}", response_model=RunStatusResponse)
     async def get_run_status(

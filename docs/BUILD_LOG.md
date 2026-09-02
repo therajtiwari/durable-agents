@@ -2221,3 +2221,349 @@ swallowed (so the orchestrator's own retry logic actually sees it).
 
 Live-tests tier, `POST /runs`, then the L1 classifier sub-layer this
 unblocks.
+
+---
+
+## Iteration 27 — a real 404, a real bug, and the formal live-tests tier (Phase 2, item 8)
+
+### First, an actual live call surfaced a real bug the mocks couldn't
+
+Before formalizing anything, ran `OpenAICompatibleClient` against a
+real Groq endpoint by hand for the first time — every prior test used
+`httpx.MockTransport`. It 404'd immediately. Root cause: **httpx merges
+a client's `base_url` with a relative request path by raw string
+concatenation, inserting no separator.** `base_url="https://host/v1"`
+(no trailing slash, the natural way anyone writes one) plus a request
+path `"/chat/completions"` (leading slash) produced
+`https://host/v1chat/completions` — silently malformed, and a mock
+server doesn't care what path it's asked for, so nothing caught it.
+
+Fixed by normalizing `base_url` to always end with exactly one `/` and
+requesting the relative path without a leading one. Added
+`test_request_url_is_not_mangled_by_base_url_merging`, which asserts on
+the actual captured request URL — the exact thing every prior test
+never checked. Also stopped swallowing the response body on an HTTP
+error (`raise_for_status()` alone discards it): a bare 404 is
+indistinguishable from a wrong URL without the provider's own
+explanation of why, which cost real debugging time once already.
+
+Two small diagnostic scripts came out of chasing this down further (a
+retired Groq model name, found via a second real 404):
+`examples/list_models.py` (asks a provider's `/models` endpoint what it
+actually serves, since provider model names churn and a decommissioned
+one 404s identically to a wrong URL) and making
+`examples/live_smoke_test.py`'s `base_url`/`model` env-overridable so
+this can't rot the same way twice.
+
+### Two richer live scenarios, at the user's request
+
+`examples/live_offboarding.py` — the same offboarding domain as
+`offboarding_agent.py`, but with a *real* model choosing the tool
+sequence instead of a scripted one, a vendor call that fails once and
+is retried with the same idempotency key, a destructive step that
+parks for approval, and resume from a completely fresh `Runtime` and
+HTTP client (nothing carried over in memory, unlike `ScriptedLLM`'s own
+position-slicing trick).
+
+`examples/live_incident_triage.py` — built specifically to answer "what
+did the LLM help with?" honestly: the offboarding task is a fixed
+checklist a `for` loop would do better, cheaper, and deterministically.
+This one has a real trap — the alerting service (`checkout-service`)
+has its own recent deploy, but the actual cause is a config change to a
+*dependency* (`payments-service`) that cut its DB connection pool.
+Getting it right requires chaining evidence across five tool calls
+(alert → logs → dependency → its logs → its deploy history) and
+correlating timestamps; the obvious, scriptable response — "roll back
+the alerting service's latest deploy" — is wrong. Run against a real
+model (`openai/gpt-oss-120b` via Groq), it correctly identified
+`payments-service` as the cause. It also surfaced a second real bug:
+after the approved rollback, the model made a legitimate verification
+call (`get_metrics`, read-only) that happened to repeat a prior
+argument set for the third time, and `detect_loop`'s heuristic — same
+tool + same args, N times, block — can't distinguish that from a
+genuinely stuck agent. Logged as a known false positive, not fixed
+here; the fix (exempting read-only tools, or resetting the count after
+a state-changing call) is a real design choice for later.
+
+### Replay output rewritten, twice, at the user's request
+
+The trace from that incident run was unreadable — one long line per
+event, tool results and error messages running off-screen. Rewrote
+`cli.py`'s inline `_event_detail()` into a new `replay_view.py`:
+grouped by step with dividers, plain-English headlines
+(`model decided: get_metrics(...)`, `PAUSED, needs human approval`)
+instead of raw event class names, long values wrapped instead of run
+into one line, `LLMCallRequested` hidden by default as noise
+(`--thinking` brings it back), theme-aware colour (auto-detects a real
+terminal, respects `NO_COLOR`, `--no-color` to force off) used only
+where it carries meaning (green success, red failure, yellow
+guardrails/approval).
+
+First pass still truncated long values and used ANSI blue for
+`LLMCallCompleted` lines. Both were flagged directly: blue is close to
+unreadable on a dark terminal (replaced with bold, no fixed hue — any
+hardcoded colour is wrong on somebody's theme), and truncating an audit
+trail defeats the point of having one (`--full` removed entirely;
+`_wrap()` now wraps every value, including headlines, to the terminal
+width instead of eliding anything). Emoji/box-drawing markers were also
+replaced with plain ASCII (`ok`, `!!`, `->`, `##`) — this output gets
+piped, pasted into tickets, and read over SSH, none of which reliably
+survive Unicode glyphs or a Windows console's legacy codepage.
+
+### The live-tests tier itself
+
+Per spec's own "Layer 8 — live tests": `tests/live/test_live_llm.py`,
+two tests only — a bare completion (the cheapest possible real call;
+if this fails nothing else in the tier will) and one full
+`Runtime` + tool-calling round trip, asserting `"136" in final_answer`
+rather than exact wording, since a real model's phrasing varies run to
+run.
+
+Reads `LLM_API_KEY`/`LLM_BASE_URL`/`LLM_MODEL` from the environment
+rather than a provider-specific name — baking `GROQ_API_KEY` into the
+test suite itself would be the same vendor bias `OpenAICompatibleClient`
+was built to avoid (`tests/live/conftest.py` says so directly).
+
+`pyproject.toml` gained `markers = ["live: ..."]` and
+`addopts = "-m 'not live'"`, so a bare `pytest` — including CI on every
+push — never runs this tier or touches the network; `pytest -m live
+tests/live` opts in explicitly (the two `-m` values don't conflict:
+pytest keeps only the last one given, so the explicit flag correctly
+overrides the addopts default). Fixing this cost one real debugging
+step: the first version of `markers` used Python-style adjacent-string
+concatenation across two lines, which TOML does not support — it
+silently parsed as a syntax error mypy caught (`Unclosed array`) before
+any test ever ran.
+
+Verified all three ways: default `pytest` run stays green and reports
+the two live tests as *deselected*, not run; `pytest -m live tests/live`
+with no key set reports them *skipped* with a clear reason; run a third
+time with a real `LLM_API_KEY` against Groq, both pass for real
+(`2 passed in 1.98s`).
+
+**Full regression:** `mypy --strict` clean, 115/115 non-live tests
+passing (2 deselected by default, as designed), 2/2 live tests passing
+against a real provider.
+
+### Phase 2 remaining
+
+`POST /runs`, then the L1 classifier sub-layer.
+
+---
+
+## Iteration 28 — loop detection false positive, fixed
+
+`live_incident_triage.py` (Iteration 27) surfaced a real gap, logged
+but deliberately not fixed at the time so it could get its own
+deliberate design pass: after the agent correctly diagnosed and rolled
+back the real cause, it made a legitimate read-only verification call
+(`get_metrics`, checking that the fix worked) that happened to repeat
+an earlier argument set for the third time. `detect_loop`'s heuristic —
+same tool, same args, N times, block — couldn't distinguish that from
+a genuinely stuck agent, and blocked an otherwise-correct run.
+
+### The fix: loop detection only applies to tools with a real side effect
+
+`detect_loop` gained a `tools: dict[str, Tool]` parameter and now
+returns `None` immediately unless the proposed tool has
+`side_effect=True`. Reasoning: the actual harm this check exists to
+prevent is *redoing something with a side effect* — a second refund, a
+second rollback. A repeated read-only call (checking status again,
+polling until something changes) is normal investigative behavior, not
+a stuck agent, and the run's own step/cost caps already bound plain
+wasted effort from an unproductive loop regardless of which tools it
+calls. Considered and rejected: resetting the loop counter after any
+side-effecting call in between — it wouldn't have caught this exact
+case (the read-only repeats spanned the fix, not just before or after
+it) and adds complexity the simpler side-effect gate doesn't need.
+
+`orchestrator.py`'s one call site updated to pass `self._tools` through
+— it already had the dict in scope for the unrelated-but-adjacent
+unknown-tool check.
+
+### A second thing found while touching this: mypy had a silent blind spot
+
+Running the full `mypy --strict src tests` (rather than checking
+`src` and each test subdirectory separately, which is what every prior
+iteration had actually done) surfaced a "Duplicate module named
+conftest" error — `tests/integration/conftest.py` and
+`tests/live/conftest.py` collide as the same bare module name once
+mypy is asked to check both directories in one invocation, since
+neither has an `__init__.py`. This had been true since Iteration 27
+added the second `conftest.py`, silently never caught because nobody
+had run the combined check since.
+
+Fixed via `pyproject.toml`: `explicit_package_bases = true` plus
+`mypy_path = "src:tests/guardrails:tests/live"` — the extra roots are
+needed because `tests/guardrails/test_corpus_eval.py` and
+`tests/live/test_live_llm.py` both rely on pytest's own "rootless"
+import mode inserting their directory onto `sys.path` at runtime (so
+`from corpus import ...` / `from conftest import ...` resolve when
+pytest actually runs them); mypy doesn't replicate that behavior on its
+own and needs telling separately. No test file changed — a pure config
+fix, verified by confirming `mypy --strict src tests` now passes in one
+shot where it previously errored before reaching most of the tree.
+
+### Tests
+
+5 in `test_guardrails_run_level.py` (one renamed for clarity): the
+existing side-effecting-tool-loop test kept as a regression (loop
+detection must still fire for the dangerous case), a new test proving
+three identical read-only calls are *not* flagged, and a new test
+confirming an unregistered tool name is declined rather than
+misreported as a loop (that's L3's allowlist check's job).
+
+**Full regression:** `mypy --strict src tests` clean in a single
+invocation for the first time (54 files), 117/117 non-live tests
+passing (2 new, 1 renamed), 2 deselected by default as designed.
+
+---
+
+## Iteration 29 — POST /runs, completing the HTTP surface (Phase 2, item 9)
+
+### One design fork, resolved before writing anything
+
+Confirmed with the user: `POST /runs` records the `RunStarted` event
+and returns immediately — it does **not** execute the agent. Rejected
+alternative: block the request until the run completes or parks
+(mirroring `Runtime.start()`). Two reasons against: an agent run can
+take minutes, and holding an HTTP connection open that long is fragile
+against timeouts, load balancers, and client retries; and it would
+require the API layer to also own an `LLMClient` + tool registry — a
+real architecture change from today's store-only `create_app(store)`.
+This also matches what `approve`/`deny` already do (record a decision,
+leave execution to whoever calls `resume()`), so the whole surface is
+now internally consistent: every mutating endpoint records, nothing
+executes inline.
+
+### The endpoint
+
+`create_app()` gained four keyword-only defaults (`default_model`,
+`default_max_steps`, `default_max_cost_usd`, `default_guardrail_profile`)
+so a deployment configures its own policy without touching endpoint
+code, mirroring `Runtime`'s own constructor defaults without actually
+coupling the two. `POST /runs` builds a `RunStarted` from the request
+body (falling back to those defaults for anything unspecified),
+appends it at seq 0, and returns the same `RunStatusResponse` shape
+`GET /runs/{id}` already returns — confirmed by a test that starts a
+run and asserts the POST response and a subsequent GET are identical,
+i.e. no separate source of truth between them.
+
+### Tests
+
+3 new in `test_api.py`: a run is recorded without anything executing
+(exactly one event, and `GET` immediately after agrees with the `POST`
+response); configured defaults are applied when the request omits a
+field; per-request values override those defaults when supplied. Two
+of the three needed `isinstance(started, RunStarted)` narrowing to
+satisfy `mypy --strict` against the discriminated `Event` union — the
+same pattern already used elsewhere in this codebase for exactly this
+reason.
+
+README gained a short HTTP API section (all four endpoints, one table)
+and `DECISIONS.md` recorded the record-vs-execute reasoning.
+
+**Full regression:** `mypy --strict src tests` clean, 120/120 non-live
+tests passing (3 new), 2 deselected as designed.
+
+### Phase 2 — fully complete
+
+All of spec's Component 5 + Layer 8 scope, plus the API surface, now
+exists: `OpenAICompatibleClient` (Iteration 26), the live-tests tier
+(Iteration 27), the `detect_loop` false positive it surfaced (Iteration
+28), and `POST /runs` completing start/status/approve/deny over HTTP
+(this iteration). Remaining, deliberately last since it's optional and
+this project's own eval already showed regex detection is the weakest
+layer: the L1 classifier sub-layer (a real model asked "is this text
+trying to manipulate an AI system?"), unblocked now that a real
+`LLMClient` exists.
+
+---
+
+## Iteration 30 — running the API for real found two more bugs, and a genuine design gap
+
+Went and actually ran `examples/run_api_server.py` against real Postgres
+and curled every endpoint by hand, rather than trusting the test suite
+alone. Found three real problems.
+
+### Bug: asyncpg pool bound to a dead event loop
+
+First run of `POST /runs` returned `500 Internal Server Error`. Server
+log: `asyncpg.exceptions._base.InterfaceError: cannot perform
+operation: another operation is in progress`. Root cause: the script
+built the connection pool inside one `asyncio.run()` call, then handed
+the resulting app to `uvicorn.run(app, ...)` — which starts its *own*,
+separate event loop internally. asyncpg binds a pool to the loop that
+created it; by the time a request tried to use the pool, the loop that
+created it had already been torn down.
+
+Fixed by driving `uvicorn.Server(config).serve()` directly, awaited
+from inside the same coroutine that builds the pool, so pool creation
+and every request the server ever handles share one event loop for the
+process's entire lifetime. Re-verified by hand: `POST /runs` returns a
+real run, `GET` on it round-trips, `POST /approve` on a non-parked run
+correctly 409s, an unknown run correctly 404s, `/docs` loads.
+
+`uvicorn` added as a new dependency (asked first) — to the `api` extra
+and the dev group — since nothing in the project needed an actual ASGI
+server to run until this script existed.
+
+### User footgun found next: Swagger UI's default `0` for integer fields
+
+Starting a run through the browser's `/docs` page without editing the
+pre-filled `max_steps`/`max_cost_usd` fields silently sent literal
+`0`s. `POST /runs` only substitutes its configured defaults when a
+field is *absent*, not when it's explicitly `0` — so the run was
+recorded with `max_steps=0`, which would fail with
+`max_steps_exceeded` before the model is ever called once. Not a code
+bug (the endpoint's default-substitution logic is doing exactly what
+it says), but a real, silent trap for anyone using the auto-generated
+docs page rather than a hand-written request. Noted for anyone writing
+the eventual demo page: don't trust Swagger's placeholder values as
+"leave this alone" — they're valid input.
+
+### The actual design gap: `resume` never looked at what a run was for
+
+The user then created a run with an arbitrary goal ("What is 10+399")
+via `POST /runs` and ran `durable-agents resume` on it — and watched it
+produce refund behavior instead. Reading `_start_or_resume` (shared by
+`start` and `resume` since Iteration 11) confirmed why: it **always**
+wired up the one hardcoded scripted refund conversation and the fake
+refund tools, completely regardless of which `run_id` it was given or
+what that run's own `RunStarted.goal` actually said. This was a
+leftover from Week 1-3, when `start`/`resume` existed purely to prove
+crash-resume against one fixed scenario, long before the API or a real
+`LLMClient` existed to run anything else — never generalized once
+those did.
+
+Split into two distinct commands rather than patching one:
+
+- **`durable-agents demo [run_id]`** — the exact old behavior,
+  unchanged: fixed scripted conversation, fake refund tools, zero
+  setup, zero API key, zero network. `run_id` is now optional
+  (`nargs="?"`) — omit it to start fresh, pass one to resume a demo run
+  killed mid-flight.
+- **`durable-agents resume <run_id>`** — genuinely generic now. Builds
+  a real `OpenAICompatibleClient` from `LLM_API_KEY`/`LLM_BASE_URL`/
+  `LLM_MODEL` (same env-var convention as `tests/live` and every
+  `examples/live_*.py` script — see `DECISIONS.md`'s "Provider client"
+  section for why that's the convention rather than a provider-specific
+  name), and runs with **no tools at all**: the CLI has no way to know
+  what functions a specific deployment wants wired up for an arbitrary
+  run. Missing `LLM_API_KEY` fails immediately with a clear message
+  rather than doing anything silently wrong — verified by hand, no key
+  set, correct error and exit code.
+
+Rejected: teaching `resume` to load tools from a config file or module
+path. Real feature, more scope than this fix needed — a run that
+genuinely needs tools gets a real script against `Runtime`/
+`Orchestrator` directly, which is already how every `examples/live_*.py`
+script works.
+
+**Verified by hand:** `durable-agents demo` still completes exactly as
+before (proving the split didn't regress the zero-setup path);
+`durable-agents resume <run_id>` with no `LLM_API_KEY` set fails
+cleanly with the intended message and a nonzero exit code.
+
+**Full regression:** `mypy --strict` clean across 63 files, 120/120
+non-live tests passing, 2 deselected as designed.

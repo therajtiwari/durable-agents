@@ -441,7 +441,7 @@ class Orchestrator:
         profile = get_profile(state.guardrail_profile)
         output_result = await validate_output(tool_call, self._tools, policy_caps=profile.policy_caps)
         matches = list(output_result.matches)
-        loop_match = detect_loop(state, tool_call, threshold=profile.loop_threshold)
+        loop_match = detect_loop(state, tool_call, self._tools, threshold=profile.loop_threshold)
         if loop_match is not None:
             matches.append(loop_match)
         seq, worst = await self._append_guardrail_hits(
