@@ -1,10 +1,36 @@
-from durable_agents.guardrails.decisions import PROFILES, decide, get_profile
+import pytest
+
+from durable_agents.guardrails.decisions import (
+    DEFAULT_PROFILE,
+    PROFILES,
+    decide,
+    get_profile,
+)
 from durable_agents.guardrails.types import GuardMatch
 
 
-def test_unknown_profile_falls_back_to_standard() -> None:
-    assert get_profile(None) is PROFILES["standard"]
-    assert get_profile("something-nobody-configured") is PROFILES["standard"]
+def test_no_profile_named_gets_the_validation_default() -> None:
+    """The default runs the checks that cannot be wrong and none of the
+    pattern matching — see DEFAULT_PROFILE for why.
+    """
+
+    assert get_profile(None) is PROFILES["validation"]
+    assert get_profile("") is PROFILES["validation"]
+    assert PROFILES[DEFAULT_PROFILE] is PROFILES["validation"]
+
+
+def test_unknown_profile_raises_instead_of_silently_downgrading() -> None:
+    """It used to fall back to standard, so a typo'd "strct" left a
+    deployment believing it ran strict. A name nobody recognises is a
+    configuration bug in a safety layer, and should be loud.
+    """
+
+    with pytest.raises(ValueError) as exc:
+        get_profile("strct")
+
+    message = str(exc.value)
+    assert "strct" in message
+    assert "strict" in message and "validation" in message, "the error must list the valid names"
 
 
 def test_financial_v1_alias_maps_to_standard() -> None:

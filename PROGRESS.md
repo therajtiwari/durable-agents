@@ -891,30 +891,41 @@ first. Worth recording why the extra tests happened: the first pass had
 five, and the denial-mid-batch path was code written on an assertion
 with no test behind it. Full detail: `docs/BUILD_LOG.md` iteration 33.
 
-**Remaining publish blockers, in the order agreed:**
+**All six publish blockers are now closed.**
 
-1. ~~Parallel tool calls silently dropped~~ — done, Iteration 33.
-2. **Raw PII persisted into the append-only log.** `scan_pii` puts the
-   matched text in `GuardMatch.detail`, which flows unfiltered onto
-   `GuardrailTriggered` and into JSONB. Confirmed: a card number and an
-   email written verbatim into a table the architecture forbids
-   deleting from. Spec §15 already specifies the correct payload
-   (entity + placeholder, never the value) and says why.
-3. **Guardrails can't be disabled** and `get_profile()` silently falls
-   back to `standard` on an unknown name, while the README calls them
-   optional.
-4. **No `LICENSE` file** despite `license = "MIT"` in metadata and the
-   README.
-5. **Two empty stub modules ship in the wheel** —
-   `llm/anthropic_client.py` and `llm/replay.py`, both 0 bytes, both
-   names the spec promises.
-6. **`durable-agents init-db` prints the DSN**, password included.
+1. ~~Parallel tool calls silently dropped~~ — Iteration 33.
+2. ~~Raw PII persisted into the append-only log~~ — Iteration 34.
+   `scan_pii` now records `{entity, placeholder, span}`, never the
+   value. Injection matches deliberately keep `matched` (attack text,
+   not personal data) and a test guards that asymmetry.
+3. ~~Guardrails can't be disabled~~ — Iteration 34. `off` and
+   `validation` profiles added, `validation` is the new default, and an
+   unknown profile name raises instead of silently becoming `standard`.
+4. ~~No `LICENSE` file~~ — Iteration 34, verified present in the wheel.
+5. ~~Two empty stub modules ship in the wheel~~ — Iteration 34, deleted.
+6. ~~`init-db` prints the DSN password~~ — Iteration 34, redacted.
 
-Then the should-fix set (event `schema_version` while no logs exist in
-the wild; demo `policy_caps` hardcoded into shipped profiles; a REDACT
-verdict on injection that redacts nothing; no CI at all; `cli.py`
-importing demo modules at module scope; cap checks running before the
-in-flight check), and only then Docker/deploy and Phase 4.
+**Guardrail numbers after the default change**, measured across the
+bundled 80-case corpus:
+
+| profile | attack success | false positives | |
+|---|---|---|---|
+| `off` | 100% | 0% | nothing runs |
+| `validation` | 50% | 0% | **default** |
+| `lenient` | 25% | 5% | |
+| `standard` | 0% | 20% | previous default |
+| `strict` | 0% | 25% | |
+
+**Should-fix set, still open:** event `schema_version` while no logs
+exist in the wild; demo `policy_caps` still hardcoded into the shipped
+profiles (deliberately left — there is no configuration path for
+supplying your own yet, so emptying them would delete a documented
+check rather than fix the bias); a REDACT verdict on injection that
+redacts nothing; no CI at all; `cli.py` importing demo modules at
+module scope; cap checks running before the in-flight check; the loose
+phone pattern that masks 13-digit order IDs.
+
+Then Docker/deploy and Phase 4.
 
 ## Week 6, Day 2 — approval queue: `GET /approvals`
 

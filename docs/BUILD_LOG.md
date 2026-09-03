@@ -2960,3 +2960,118 @@ tests (19 new: 13 unit, 6 chaos; 21 of them failing without the fix),
 `examples/quickstart.py` verified end to end. `orchestrator.py` diffed
 byte-identical against a backup after each temporary revert, so nothing
 from the red runs leaked into the committed state.
+
+## Iteration 34 — audit blockers 2 through 6
+
+Four mechanical fixes and one real decision, all from the pre-publish
+audit.
+
+### The three small ones
+
+`llm/anthropic_client.py` and `llm/replay.py` were 0-byte Week 1
+scaffolding that would have shipped in the wheel under the names of two
+LLM implementations the spec promises — `from ... import AnthropicClient`
+would have raised a confusing ImportError on a module that visibly
+exists. Deleted; verified absent from a built wheel.
+
+`LICENSE` added and wired up with `license-files`, since `license = "MIT"`
+in metadata and "MIT." in the README were the only statements of terms
+anywhere. Verified present in the built wheel at
+`dist-info/licenses/LICENSE`.
+
+`durable-agents init-db` printed the full DSN on success, password
+included, into terminal scrollback and CI logs. Now redacted via
+`redact_dsn`, which keeps the host and database (the useful part) and
+stars the password. An unparseable string falls back to everything after
+the last `@`, because guessing at the structure of a malformed
+connection string risks leaking the thing the function exists to hide.
+
+### PII out of the event log
+
+`scan_pii` built `GuardMatch(detail={"matched": m.group()})`, the
+orchestrator copied that onto `GuardrailTriggered.detail`, and
+`PostgresEventStore.append` serialised the whole payload to JSONB. A
+card number therefore landed verbatim in a table this architecture
+forbids updating or deleting — so there was no remediation for a
+subject-erasure request short of dropping the table, and the leak was in
+the event whose entire purpose is recording that a secret was redacted.
+Spec section 15 specifies the correct payload and calls getting it wrong
+"the difference between an audit log and a data breach".
+
+Now `{"entity", "placeholder", "span"}`. All three layers scan through
+this one function, so L1, L2 and L3 were fixed together.
+
+Injection matches deliberately keep `matched`, and there is a test
+saying so: that text is the attack rather than anyone's personal data,
+and keeping it is what makes "has this agent been targeted?" answerable
+from the log. The asymmetry is now a decision with a test behind it
+instead of an accident of which code path ran.
+
+### The default guardrail profile
+
+The real one. The default was `standard`, which blocks injection matches
+at 0.85 confidence — and since L2 scans every tool result, ordinary
+machine output was fatal:
+
+```
+BLOCK   {"error": "system: disk full on node 3"}
+BLOCK   {"log": "2026-09-03 SYSTEM: restart complete"}
+BLOCK   {"ticket": "Customer asks to disregard the previous quote"}
+```
+
+None of those are attacks. Any agent that reads logs, tickets or error
+messages hits this, and the failure is `RunFailed` in a library whose
+whole pitch is that runs survive.
+
+The insight is that "guardrails" here is two features sharing a knob.
+Deterministic validation (schema, allowlist, policy caps, loop
+detection) has no false positives by construction — it is argument
+checking, not a security opinion. Pattern matching is a 20%-false-
+positive guess whose failure mode is a dead run.
+
+So `GuardrailProfile` gained four switches (`deterministic_checks`,
+`pii_detection`, `injection_patterns`, `delimit_tool_results`) and a
+`considers(rule)` method the orchestrator applies before appending
+anything — a layer that is switched off produces no events at all,
+rather than a run of ALLOWs, because an audit trail should record checks
+that were actually made. `off` also stops `_sanitize_for_llm` rewriting
+what the model sees, since "off" has to mean the library stops having
+opinions about your prompts or it is not worth having.
+
+New profile set, with the whole corpus re-measured so the trade is
+visible rather than asserted:
+
+```
+       off: attack success 100%, false positives  0%
+validation: attack success  50%, false positives  0%   <- new default
+   lenient: attack success  25%, false positives  5%
+  standard: attack success   0%, false positives 20%   <- old default
+    strict: attack success   0%, false positives 25%
+```
+
+The default catches the deterministic half of the threat model and none
+of the probabilistic half. That is the trade, and the README now states
+it in those terms.
+
+`get_profile` also raises on an unknown name instead of falling back to
+`standard` — a typo'd `"strct"` used to leave a deployment believing it
+ran strict.
+
+**A bug this nearly introduced:** `tests/guardrails/test_corpus_eval.py`
+iterates every profile, but scored raw `decide()` output, which does not
+know about `considers()`. That would have credited `validation` with
+catching injections it never looks at — reporting protection no real run
+gets. Fixed so the eval mirrors the orchestrator; the 50% figure above
+is the honest one.
+
+**Also caught mid-change and backed out:** emptying `policy_caps` in the
+shipped profiles (audit finding 8, the demo's `issue_refund`/
+`amount_inr` caps meaning nothing to any other consumer). There is
+currently no configuration path for supplying your own, so emptying them
+would silently delete a documented check rather than fix the bias. Left
+in place with a comment naming it as a known wart, tracked separately.
+
+**Full regression:** `mypy --strict` clean (60 files), 180/180 non-live
+tests (9 new), wheel built and inspected. The PII tests were confirmed
+red against the old payload shape first; `patterns.py` was diffed
+byte-identical against a backup afterwards.

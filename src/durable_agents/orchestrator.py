@@ -251,7 +251,9 @@ class Orchestrator:
         kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
         os.kill(os.getpid(), kill_signal)
 
-    def _sanitize_for_llm(self, messages: list[Message]) -> list[Message]:
+    def _sanitize_for_llm(
+        self, messages: list[Message], profile: GuardrailProfile
+    ) -> list[Message]:
         """Applied only to what's sent to the LLM, never to state.messages
         itself — the stored history stays the raw ground truth an
         auditor can trust; this exists purely at the provider boundary.
@@ -261,17 +263,29 @@ class Orchestrator:
         when the full history is resent at step 5, and scan_pii/
         wrap_untrusted are pure and cheap enough that recomputing costs
         nothing worth caching.
+
+        Both halves follow the profile. The "off" profile leaves what
+        the model sees exactly as the log recorded it, which is what
+        "off" has to mean for it to be worth having: a consumer who
+        wants durable execution and no opinions should not find their
+        prompts quietly rewritten.
         """
+
+        def redact(text: str) -> str:
+            if not profile.pii_detection:
+                return text
+            _matches, redacted = scan_pii(text)
+            return redacted
 
         sanitized: list[Message] = []
         for i, message in enumerate(messages):
             if i == 0 and message.role == "user" and message.content is not None:
-                _matches, redacted = scan_pii(message.content)
-                sanitized.append(replace(message, content=redacted))
+                sanitized.append(replace(message, content=redact(message.content)))
             elif message.role == "tool" and message.content is not None:
-                _matches, redacted = scan_pii(message.content)
-                wrapped = wrap_untrusted(message.tool_name or "unknown", redacted)
-                sanitized.append(replace(message, content=wrapped))
+                content = redact(message.content)
+                if profile.delimit_tool_results:
+                    content = wrap_untrusted(message.tool_name or "unknown", content)
+                sanitized.append(replace(message, content=content))
             else:
                 sanitized.append(message)
         return sanitized
@@ -294,7 +308,12 @@ class Orchestrator:
 
         severity = {"ALLOW": 0, "REDACT": 1, "ESCALATE": 2, "BLOCK": 3}
         worst = "ALLOW"
-        for match in matches:
+        # Detections from a layer this profile has switched off are
+        # dropped here rather than at each call site, so every path gets
+        # the filter and none can forget it. Nothing is appended for
+        # them: an audit trail should record the checks that were
+        # actually made, not a run of ALLOWs from checks that weren't.
+        for match in [m for m in matches if profile.considers(m.rule)]:
             action = decide(match, profile)
             if action in ("BLOCK", "ESCALATE"):
                 logger.warning(
@@ -580,7 +599,7 @@ class Orchestrator:
         if op.kind == "llm":
             try:
                 response = await self._llm.call(
-                    self._sanitize_for_llm(state.messages),
+                    self._sanitize_for_llm(state.messages, get_profile(state.guardrail_profile)),
                     _tool_schemas(self._tools),
                     state.system_prompt,
                 )

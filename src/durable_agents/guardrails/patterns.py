@@ -28,6 +28,15 @@ INJECTION_PATTERNS: list[tuple[str, re.Pattern[str], float]] = [
 
 
 def scan_patterns(text: str) -> list[GuardMatch]:
+    """Injection matches DO record the text they matched, deliberately.
+
+    That text is the attack, not the victim — it is what makes "has this
+    agent ever been targeted, and how?" answerable from the event log,
+    which is most of the argument for guardrail decisions living there at
+    all. Contrast scan_pii below, where the matched text is precisely the
+    thing that must never be written down.
+    """
+
     matches: list[GuardMatch] = []
     for rule, regex, confidence in INJECTION_PATTERNS:
         m = regex.search(text)
@@ -98,6 +107,19 @@ def scan_pii(
     action of actually using redacted_text instead of the original is
     decisions.py's call, not this function's.
 
+    A match records what KIND of thing was found and where, never the
+    value. Every GuardMatch here ends up on a GuardrailTriggered event,
+    which is appended to a log that by design is never updated and never
+    deleted — so a card number written into it could not be removed
+    afterwards even in principle, and the event whose entire purpose is
+    recording that a secret was redacted would be the thing storing it.
+    SPEC.md section 15 specifies this payload shape and calls getting it
+    wrong "the difference between an audit log and a data breach".
+
+    The span is offsets into the text that was scanned, which is enough
+    to line a hit up against the redacted content an auditor can see,
+    without reproducing the original.
+
     On overlapping matches from different patterns (e.g. the loose
     phone pattern catching part of a credit card number), the earlier
     entry in `patterns` wins and the overlapping candidate is dropped —
@@ -127,7 +149,15 @@ def scan_pii(
         counters[pattern.name] = counters.get(pattern.name, 0) + 1
         placeholder = f"<{pattern.name.upper()}_{counters[pattern.name]}>"
         matches.append(
-            GuardMatch(rule=f"pii_{pattern.name}", confidence=1.0, detail={"matched": m.group()})
+            GuardMatch(
+                rule=f"pii_{pattern.name}",
+                confidence=1.0,
+                detail={
+                    "entity": pattern.name,
+                    "placeholder": placeholder,
+                    "span": [m.start(), m.end()],
+                },
+            )
         )
         replacements.append((m.start(), m.end(), placeholder))
 

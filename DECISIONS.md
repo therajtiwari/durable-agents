@@ -133,6 +133,33 @@ formats. Country-specific patterns are the consumer's configuration.
 **Policy caps are configuration, not constants,** for the same reason —
 `₹1,00,000` is the demo's number, not a claim about anyone's business.
 
+**The default profile runs validation and no pattern matching.**
+Rejected: keeping `standard` (pattern matching, blocks at ≥0.85
+confidence) as the default, which is what shipped until a pre-publish
+audit. The two things called "guardrails" here have opposite
+characteristics — deterministic validation has no false positives by
+construction, while the injection regexes measure a 20% false positive
+rate whose failure mode is `RunFailed`. Since L2 scans every tool
+result, ordinary machine output was fatal: `{"error": "system: disk
+full"}` matches `injection_system_override` at 0.9 and kills the run.
+In a library whose entire promise is that runs survive, a bundled regex
+that kills one run in five undermines the part that actually works, and
+a first-time user would reasonably conclude the durable-execution half
+was broken.
+
+The asymmetry decides it. Pattern matching off when you wanted it on
+leaves you exactly where every other agent framework does — none of
+them ship injection filters. Pattern matching on when you didn't ask
+for it breaks working runs. `off`, `validation` (default), `lenient`,
+`standard` and `strict` all remain; the pattern layer is opted into by
+name, by someone who has read what it costs. Measured across the whole
+corpus so the trade is visible rather than asserted: validation is 50%
+attack success at 0% false positives, standard is 0% at 20%.
+
+**An unknown profile name raises.** It used to fall back to `standard`,
+so a typo'd `"strct"` left a deployment believing it ran strict.
+Configuration bugs in a safety layer should be loud.
+
 **Deterministic violations always `BLOCK`, regardless of profile.**
 Only confidence-based injection matches vary by strictness. A schema
 violation or an exceeded numeric cap isn't a probabilistic guess that a

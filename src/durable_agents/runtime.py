@@ -52,7 +52,7 @@ class Runtime:
         system_prompt: str = "",
         max_steps: int = 25,
         max_cost_usd: Decimal | float | str = Decimal("1.00"),
-        guardrail_profile: str = "standard",
+        guardrail_profile: str = "validation",
         max_llm_attempts: int = 3,
         max_tool_attempts: int = 3,
         retry_base_delay_seconds: float = 1.0,

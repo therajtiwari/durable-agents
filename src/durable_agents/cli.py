@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import os
 import sys
+from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
 from durable_agents.events import LLMCallCompleted
@@ -17,6 +18,32 @@ from durable_agents.tools.refund_demo_scenario import canonical_run_started, can
 from durable_agents.tools.refund_tools import build_refund_tools
 
 DEFAULT_DSN = "postgresql://durable_agents:durable_agents@localhost:5432/durable_agents"
+
+
+def redact_dsn(dsn: str) -> str:
+    """A connection string with the password starred out, safe to print.
+
+    Which database was touched is genuinely useful to see; the password
+    sitting next to it is not, and stdout is exactly where credentials
+    escape — terminal scrollback, CI logs, screen shares. An
+    unparseable string is reported as-is minus everything before the
+    "@", since guessing at its structure risks leaking the very thing
+    this exists to hide.
+    """
+
+    try:
+        parts = urlsplit(dsn)
+    except ValueError:
+        return dsn.rsplit("@", 1)[-1]
+
+    if parts.password is None:
+        return dsn
+
+    host = parts.hostname or ""
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    userinfo = f"{parts.username}:***@" if parts.username else "***@"
+    return urlunsplit((parts.scheme, f"{userinfo}{host}", parts.path, parts.query, parts.fragment))
 
 
 
@@ -167,7 +194,7 @@ def main() -> None:
 
     if args.command == "init-db":
         asyncio.run(create_schema(args.dsn))
-        print(f"Schema ready on {args.dsn}")
+        print(f"Schema ready on {redact_dsn(args.dsn)}")
     elif args.command == "replay":
         asyncio.run(
             _replay(

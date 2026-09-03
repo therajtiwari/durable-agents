@@ -45,7 +45,17 @@ async def _matches_for(case: Case, tools: dict[str, Tool], policy_caps: dict[str
 
 
 def _worst_action(matches: list[GuardMatch], profile: GuardrailProfile) -> str:
-    actions = [decide(m, profile) for m in matches]
+    """Mirrors the orchestrator: detections from a layer the profile has
+    switched off are dropped before anything is decided.
+
+    Without this filter the eval would credit a profile with catching
+    attacks it never actually looks at — "validation" runs no injection
+    patterns at all, so scoring its raw matches would report protection
+    that no real run would get.
+    """
+
+    considered = [m for m in matches if profile.considers(m.rule)]
+    actions = [decide(m, profile) for m in considered]
     return max(actions, key=lambda a: _SEVERITY[a], default="ALLOW")
 
 

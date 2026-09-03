@@ -6,15 +6,48 @@ from durable_agents.guardrails.types import GuardMatch
 
 @dataclass(frozen=True)
 class GuardrailProfile:
-    """One named strictness level. Same detection code runs regardless
-    of profile (guardrails/patterns.py, output_validate.py, run_level.py
-    don't change) — only these thresholds do. See
-    docs/THREAT_MODEL.md's "Guardrail profiles" section for the
-    reasoning behind each starting number; none of it is final, it's
-    meant to be tuned against the attack corpus once one exists.
+    """One named guardrail configuration.
+
+    These cover two genuinely different kinds of check, and the switches
+    below exist because they have opposite characteristics:
+
+    **Deterministic checks** — does this tool exist, do the arguments
+    match its declared schema, is this number over a configured cap, is
+    the agent repeating one side-effecting action. These have no false
+    positives by construction. They are not really a security opinion,
+    they are argument validation, and every profile except "off" runs
+    them.
+
+    **Pattern matching** — regexes guessing whether some text is trying
+    to manipulate the model. This project's own eval measures a 20%
+    false positive rate, and a false positive here means a BLOCK, i.e. a
+    dead run. Ordinary machine output trips it: a tool returning
+    {"error": "system: disk full"} matches injection_system_override at
+    0.9 confidence. Since L2 scans every tool result, any agent that
+    reads logs, tickets or error messages runs into this. It is off in
+    the default profile and opted into by name.
+
+    See docs/THREAT_MODEL.md for the measured numbers and the reasoning
+    behind each threshold; none of it is final.
     """
 
     name: str
+    deterministic_checks: bool
+    """L3 schema/allowlist/policy-cap validation and L4 loop and
+    escalation detection. Zero false positives; on everywhere but "off".
+    """
+    pii_detection: bool
+    """Scan for PII, record that it was found (never the value — see
+    patterns.scan_pii), and redact it before anything reaches the
+    provider.
+    """
+    injection_patterns: bool
+    """The 20%-false-positive layer. Off by default, on by name."""
+    delimit_tool_results: bool
+    """Wrap every tool result in explicit untrusted-data markers before
+    the model sees it. Structural, not a detection: it cannot produce a
+    false positive because it never decides anything.
+    """
     policy_caps: dict[str, dict[str, float]]
     loop_threshold: int
     escalation_threshold: int
@@ -31,46 +64,132 @@ class GuardrailProfile:
     cost every run a redaction.
     """
 
+    def considers(self, rule: str) -> bool:
+        """Whether a detection of this kind is acted on at all.
+
+        Applied before anything is appended, so a layer this profile has
+        switched off produces no GuardrailTriggered events rather than a
+        run of ALLOWs — an audit trail should record checks that were
+        actually made.
+        """
+
+        if rule.startswith("injection_"):
+            return self.injection_patterns
+        if rule.startswith("pii_"):
+            return self.pii_detection
+        return self.deterministic_checks
+
+
+DEFAULT_PROFILE = "validation"
+"""What a run gets when nothing asks for anything else.
+
+Deliberately not one of the injection-scanning profiles. A durability
+runtime whose default kills one run in five over a regex would be
+undermining the thing it is actually good at, and a first-time user
+would reasonably conclude the durable-execution part was broken. The
+pattern layer is real work and stays available — it is opted into by
+name, by someone who has read what it costs.
+"""
+
+
+def _profile(
+    name: str,
+    *,
+    deterministic_checks: bool = True,
+    pii_detection: bool = True,
+    injection_patterns: bool = True,
+    delimit_tool_results: bool = True,
+    policy_caps: dict[str, dict[str, float]] | None = None,
+    loop_threshold: int = 3,
+    escalation_threshold: int = 3,
+    always_escalate_on_injection: bool = False,
+    injection_block_confidence: float | None = None,
+    injection_redact_confidence: float = 0.0,
+) -> GuardrailProfile:
+    return GuardrailProfile(
+        name=name,
+        deterministic_checks=deterministic_checks,
+        pii_detection=pii_detection,
+        injection_patterns=injection_patterns,
+        delimit_tool_results=delimit_tool_results,
+        # KNOWN WART, tracked separately: the shipped defaults below
+        # carry this project's own demo caps (issue_refund/amount_inr),
+        # which mean nothing to any other consumer. They stay for now
+        # because there is currently no way to supply your own — giving
+        # policy caps a real configuration path is its own change, and
+        # emptying them here would silently delete a documented check
+        # rather than fix the bias.
+        policy_caps=policy_caps if policy_caps is not None else {},
+        loop_threshold=loop_threshold,
+        escalation_threshold=escalation_threshold,
+        always_escalate_on_injection=always_escalate_on_injection,
+        injection_block_confidence=injection_block_confidence,
+        injection_redact_confidence=injection_redact_confidence,
+    )
+
 
 PROFILES: dict[str, GuardrailProfile] = {
-    "strict": GuardrailProfile(
-        name="strict",
+    # Nothing at all: no checks, no redaction, no delimiting. For a
+    # consumer who wants durable execution and no opinions about their
+    # prompts or their data.
+    "off": _profile(
+        "off",
+        deterministic_checks=False,
+        pii_detection=False,
+        injection_patterns=False,
+        delimit_tool_results=False,
+    ),
+    # The default. Everything that cannot produce a false positive.
+    "validation": _profile(
+        "validation",
+        injection_patterns=False,
+        policy_caps={"issue_refund": {"amount_inr": 100_000}},
+    ),
+    "lenient": _profile(
+        "lenient",
+        policy_caps={"issue_refund": {"amount_inr": 500_000}},
+        escalation_threshold=5,
+        injection_redact_confidence=0.85,
+    ),
+    "standard": _profile(
+        "standard",
+        policy_caps={"issue_refund": {"amount_inr": 100_000}},
+        injection_block_confidence=0.85,
+    ),
+    "strict": _profile(
+        "strict",
         policy_caps={"issue_refund": {"amount_inr": 25_000}},
-        loop_threshold=3,
         escalation_threshold=1,
         always_escalate_on_injection=True,
-        injection_block_confidence=None,
-        injection_redact_confidence=0.0,
-    ),
-    "standard": GuardrailProfile(
-        name="standard",
-        policy_caps={"issue_refund": {"amount_inr": 100_000}},
-        loop_threshold=3,
-        escalation_threshold=3,
-        always_escalate_on_injection=False,
-        injection_block_confidence=0.85,
-        injection_redact_confidence=0.0,
-    ),
-    "lenient": GuardrailProfile(
-        name="lenient",
-        policy_caps={"issue_refund": {"amount_inr": 500_000}},
-        loop_threshold=3,
-        escalation_threshold=5,
-        always_escalate_on_injection=False,
-        injection_block_confidence=None,
-        injection_redact_confidence=0.85,
     ),
 }
 
-# financial_v1 is what every existing test fixture's RunStarted.guardrail_profile
-# already carries — treated as at least as strict as "standard", since
-# refunds are exactly the domain this project's worked example is about.
+# financial_v1 predates the named profiles and is what this project's own
+# refund fixtures carry — kept resolving rather than becoming an error,
+# since an alias that already appears in event logs cannot be withdrawn
+# without making those runs unresumable.
 PROFILE_ALIASES: dict[str, str] = {"financial_v1": "standard"}
 
 
 def get_profile(guardrail_profile: str | None) -> GuardrailProfile:
-    name = PROFILE_ALIASES.get(guardrail_profile or "", guardrail_profile or "standard")
-    return PROFILES.get(name, PROFILES["standard"])
+    """Resolve a profile name, or raise if it isn't one.
+
+    Raises rather than falling back, which is what it used to do: a
+    typo'd "strct" silently resolved to standard, so a deployment could
+    believe it was running strict for months. A name nobody recognises
+    is a configuration bug, and configuration bugs in a safety layer
+    should be loud.
+    """
+
+    if guardrail_profile is None or guardrail_profile == "":
+        return PROFILES[DEFAULT_PROFILE]
+
+    name = PROFILE_ALIASES.get(guardrail_profile, guardrail_profile)
+    profile = PROFILES.get(name)
+    if profile is None:
+        valid = ", ".join(sorted(PROFILES) + sorted(PROFILE_ALIASES))
+        raise ValueError(f"unknown guardrail profile {guardrail_profile!r}; valid names: {valid}")
+    return profile
 
 
 def decide(match: GuardMatch, profile: GuardrailProfile) -> GuardrailAction:

@@ -93,7 +93,7 @@ def create_app(
     default_model: str = "unspecified",
     default_max_steps: int = 25,
     default_max_cost_usd: Decimal = Decimal("1.00"),
-    default_guardrail_profile: str = "standard",
+    default_guardrail_profile: str = "validation",
 ) -> FastAPI:
     app = FastAPI(title="durable-agents")
     app.state.store = store

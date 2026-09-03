@@ -137,11 +137,40 @@ a worker and a recovery sweeper as separate processes; they're the same
 mechanism with a different threshold, so this is one class — run two
 instances with different `stale_after_seconds` if you want the split.
 
-**Guardrails, optionally.** Four layers — input scan, tool-result scan,
-output validation, run-level loop/escalation detection — each emitting
-`GuardrailTriggered` into the same log. See
-[`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md), including the honest
-measured numbers and where they're weak.
+**Guardrails, genuinely optional.** Two different things share this
+name, and they have opposite characteristics:
+
+*Validation* — is this tool registered, do the arguments match its
+declared schema, is this number over a cap you configured, is the agent
+stuck repeating one side-effecting action. No false positives; this is
+argument checking, not a security opinion. **On by default.**
+
+*Pattern matching* — regexes guessing whether text is trying to
+manipulate the model. Measured on the bundled 80-case corpus at a **20%
+false positive rate**, and a false positive means a dead run. Ordinary
+machine output trips it: a tool returning
+`{"error": "system: disk full"}` matches an injection pattern at 0.9
+confidence, and tool results are scanned on every step. **Off by
+default**, on by name.
+
+```python
+runtime = Runtime(store=..., llm=..., guardrail_profile="standard")
+```
+
+| profile | attack success | false positives | |
+|---|---|---|---|
+| `off` | 100% | 0% | nothing runs |
+| `validation` | 50% | 0% | **default** — validation only |
+| `lenient` | 25% | 5% | + patterns, mostly logging |
+| `standard` | 0% | 20% | + patterns, blocks at ≥0.85 |
+| `strict` | 0% | 25% | + escalates on any match |
+
+Measured by `tests/guardrails/test_corpus_eval.py`, which you can run.
+The default catches the deterministic half of the threat model and none
+of the probabilistic half — that's the trade, stated plainly. An
+unrecognised profile name raises rather than quietly falling back. See
+[`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) for what each layer does
+and where it's weak.
 
 **An HTTP API, optionally** (`pip install durable-agents[api]`):
 
@@ -329,11 +358,14 @@ Read this part before adopting.
   doubles that run's model spend. No leases, no distributed scheduler.
 - **The guardrails are pattern-based, not a model.** They catch
   unsophisticated injection and obvious PII; they will not stop a
-  determined attacker. Measured on the bundled 80-case corpus:
-  0% attack success and **20% false positives** on the `standard`
-  profile. That false-positive number is real and reported on purpose —
+  determined attacker. The default profile deliberately runs none of
+  that pattern matching (50% attack success, 0% false positives) —
+  turning it on costs a 20% false positive rate, and a false positive
+  is a failed run. Both numbers are measured, and reported on purpose;
   see `docs/THREAT_MODEL.md` for why one of them is genuinely hard to
-  fix.
+  fix. If prompt-injection defence is what you came for, this is the
+  weakest part of the project and you should treat it as a starting
+  point rather than a solution.
 - **It wants your agent loop.** Today you build your agent around
   `Runtime`/`Orchestrator` rather than wrapping a loop you already have.
   A wrapper API for incremental adoption is the most-requested-shaped
