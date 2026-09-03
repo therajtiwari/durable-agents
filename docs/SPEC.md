@@ -28,9 +28,7 @@ This document is the single reference for the project. Everything discussed live
 18. [Six-week build plan](#18-six-week-build-plan)
 19. [Scope boundaries](#19-scope-boundaries)
 20. [Build discipline with Claude Code](#20-build-discipline-with-claude-code)
-21. [Interview questions this prepares you for](#21-interview-questions-this-prepares-you-for)
-22. [Resume material](#22-resume-material)
-23. [Reference reading](#23-reference-reading)
+21. [Reference reading](#21-reference-reading)
 
 ---
 
@@ -1252,50 +1250,7 @@ Naming the trade-offs you consciously deferred is more impressive than pretendin
 
 ---
 
-## 21. Interview questions this prepares you for
-
-Durability and correctness:
-
-- What happens if the process dies between calling a tool and recording the result?
-- Why can't you replay an LLM call the way you'd replay a database write?
-- How do you stop a retry from sending the same email twice?
-- Two workers pick up the same run — what stops them corrupting each other?
-- Your event log has ten million rows and rebuild is slow. Now what?
-- You need to add a field to an event type already in production. How?
-- The agent gets stuck repeating a failing action. How do you detect and break it?
-- How do you cap spend on a runaway trajectory?
-- Why is this better than checkpointing state to a row every N steps?
-
-Security:
-
-- Where does prompt injection actually enter an agent system?
-- Why is a tool result more dangerous than a user prompt?
-- Your regex filter blocks 60% of attacks. Why isn't that good enough?
-- How do you stop PII reaching the model provider?
-- What's the cost of a false positive in a guardrail, and how do you measure it?
-- Injection convinced the model to request a ₹500,000 refund on a ₹6,400 order. What stops it?
-
-**Rehearse the checkpointing one.** The honest answer: *"checkpointing gives you resume; the log additionally gives you audit, time-travel debugging, and the ability to reconstruct any past state — at the cost of storage and rebuild time."* Being able to state the *cost* of your own design is what makes the answer credible.
-
----
-
-## 22. Resume material
-
-**Line:**
-
-> Built a durable agent runtime in Python using event sourcing — agent runs survive process crashes and resume mid-trajectory with zero duplicated side effects, support indefinite human-approval pauses, and enforce four-layer prompt-injection and PII guardrails. Reduced attack success rate from 71% to 12% at a 3% false-positive rate.
-
-**Backed by:**
-- A repo with a chaos suite that kills its own process across 18 crash points
-- A README with real numbers and an honest trade-offs section
-- A live demo with kill and inject buttons
-- A two-minute video
-- A PyPI package
-- A blog post explaining the problem
-
----
-
-## 23. Reference reading
+## 21. Reference reading
 
 - **Temporal docs** — durable execution, and the activity/workflow split. The closest prior art to what you're building.
 - **Martin Fowler on event sourcing** — the canonical short explanation.
