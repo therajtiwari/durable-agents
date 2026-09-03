@@ -1,7 +1,7 @@
 from durable_agents.events import ToolCallInvocation
 from durable_agents.guardrails.run_level import detect_escalation, detect_loop
 from durable_agents.state import GuardrailHit, Message, RunState
-from durable_agents.tools.refund_tools import InMemoryRefundBackend, build_refund_tools
+from refund_demo import InMemoryRefundBackend, build_refund_tools
 from durable_agents.tools.registry import Tool
 
 

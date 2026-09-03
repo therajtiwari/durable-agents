@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import signal
 import time
@@ -143,6 +144,72 @@ def _tool_schemas(tools: dict[str, Tool]) -> list[dict[str, Any]]:
         {"name": t.name, "description": t.description, "parameters": t.parameters}
         for t in tools.values()
     ]
+
+
+_MAX_RESULT_DEPTH = 20
+
+
+def _json_safe(value: Any, depth: int = 0) -> Any:
+    """Convert a value into something JSON — and therefore JSONB — can
+    actually hold, preserving structure wherever possible.
+
+    Anything unrecognised becomes its string form rather than raising,
+    because the caller has already caused a side effect by the time this
+    runs. Depth is capped so a deeply nested or self-referencing result
+    degrades to a string instead of exhausting the stack.
+    """
+
+    if depth > _MAX_RESULT_DEPTH:
+        return _safe_str(value)
+    # bool first: it is a subclass of int, and both are JSON-native.
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        # NaN and Infinity are what Python's json emits by default and
+        # what Postgres then rejects outright — "invalid input syntax for
+        # type json" at the moment the outcome is being recorded, which
+        # is the worst possible time to fail.
+        return value if math.isfinite(value) else _safe_str(value)
+    if isinstance(value, dict):
+        return {_safe_str(k): _json_safe(v, depth + 1) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_json_safe(v, depth + 1) for v in value]
+    # Decimal, datetime, UUID, bytes, dataclasses, anything of the
+    # caller's own.
+    return _safe_str(value)
+
+
+def _safe_str(value: Any) -> str:
+    try:
+        return str(value)
+    except Exception:  # a __str__ of someone else's making
+        return f"<unrepresentable {type(value).__name__}>"
+
+
+def normalize_tool_result(result: Any) -> dict[str, Any]:
+    """Whatever a tool returned, as a dict that can be recorded.
+
+    A tool is ordinary application code and returns ordinary Python: a
+    string, None, a list, a dict holding a Decimal or a datetime. Every
+    one of those used to raise while building ToolCallCompleted or while
+    serialising it — *after* the tool had already run. The exception
+    escaped run(), so nothing recorded the outcome, the log kept a
+    dangling ToolCallRequested, and a Worker read that as "unfinished"
+    and called the tool again. Every poll. Forever.
+
+    That is the exact failure this project exists to prevent, so the one
+    rule here is that this function never raises: a result that cannot be
+    represented faithfully is recorded approximately, and the run
+    continues. A non-dict is wrapped as {"result": ...} so the recorded
+    shape is always an object, which is what the event schema and the
+    conversation history both expect.
+    """
+
+    candidate = result if isinstance(result, dict) else {"result": result}
+    safe = _json_safe(candidate)
+    if not isinstance(safe, dict):  # pragma: no cover — _json_safe keeps dicts as dicts
+        return {"result": _safe_str(result)}
+    return safe
 
 
 def _estimate_tokens(state: RunState) -> int:
@@ -520,6 +587,49 @@ class Orchestrator:
             run_id, seq, now, "L3_output", state.step, matches, profile
         )
         if worst == "BLOCK":
+            # A schema violation is the model getting an argument wrong,
+            # which is the most ordinary mistake in tool calling — not an
+            # attack, and not a reason to destroy a run that has already
+            # cost real money. Every other framework hands the error back
+            # so the model can correct itself, and this one used to be
+            # measurably *less* reliable with guardrails on than off for
+            # exactly this case.
+            #
+            # The tool call is still blocked (nothing executes, and the
+            # GuardrailTriggered event above records BLOCK truthfully) —
+            # what changes is that the run continues, with the validation
+            # error surfaced to the model as a tool result. Bounded by
+            # max_steps like any other loop, since each correction costs
+            # a step.
+            #
+            # A violation of anything else — an unregistered tool, a
+            # policy cap actually exceeded, a real loop — still ends the
+            # run, because continuing there is the unsafe direction.
+            considered = [m for m in matches if profile.considers(m.rule)]
+            schema_problems = [m for m in considered if m.rule == "schema_invalid"]
+            blocked_by_anything_else = any(
+                decide(m, profile) == "BLOCK" for m in considered if m.rule != "schema_invalid"
+            )
+            if schema_problems and not blocked_by_anything_else:
+                detail = schema_problems[0].detail
+                await self._append(
+                    run_id,
+                    seq,
+                    ToolCallFailed(
+                        seq=seq,
+                        created_at=now,
+                        step=state.step,
+                        tool=tool_call.name,
+                        arguments=tool_call.arguments,
+                        idempotency_key="",
+                        error=f"invalid arguments: {detail.get('error', 'schema validation failed')}",
+                        attempt=1,
+                        final_attempt=True,
+                        tool_call_id=tool_call.id,
+                    ),
+                )
+                return
+
             await self._append(
                 run_id,
                 seq,
@@ -713,7 +823,19 @@ class Orchestrator:
                 # before its Completed is recorded, is the exact gap
                 # only the idempotency key protects against.
                 self._maybe_chaos_kill()
-            provider_dedup_hit = bool(result.get("dedup_hit")) if isinstance(result, dict) else False
+            # From here on the side effect has happened, so everything
+            # below must be able to record that fact. Normalising first
+            # is what makes the rest safe: it is the only step that took
+            # an arbitrary value from someone else's code, and it cannot
+            # raise.
+            recorded_result = normalize_tool_result(result)
+            if recorded_result != result:
+                logger.debug(
+                    "normalised %s result for recording (%s -> dict)",
+                    op.tool,
+                    type(result).__name__,
+                )
+            provider_dedup_hit = bool(recorded_result.get("dedup_hit"))
 
             # L2 — every tool result is untrusted input. Detection here
             # drives the audit log and a BLOCK backstop; the actual
@@ -729,7 +851,7 @@ class Orchestrator:
             # reliably break that adjacency, the same serialization
             # state.py already uses to build this exact result into a
             # message.
-            result_text = json.dumps(result) if isinstance(result, dict) else str(result)
+            result_text = json.dumps(recorded_result)
             profile = get_profile(state.guardrail_profile)
             l2_result = await scan_tool_result(op.tool, result_text)
             seq, worst = await self._append_guardrail_hits(
@@ -764,7 +886,7 @@ class Orchestrator:
                     step=op.step,
                     tool=op.tool,
                     idempotency_key=op.idempotency_key or "",
-                    result=result,
+                    result=recorded_result,
                     duration_ms=duration_ms,
                     recovered=recovered,
                     provider_dedup_hit=provider_dedup_hit,

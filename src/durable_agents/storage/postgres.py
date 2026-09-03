@@ -63,6 +63,11 @@ class PostgresEventStore(EventStore):
     async def find_resumable_runs(
         self, *, stale_after_seconds: float, limit: int = 10
     ) -> list[UUID]:
+        # Postgres rejects a negative LIMIT outright; returning nothing
+        # matches the in-memory store so callers see one behaviour.
+        if limit <= 0:
+            return []
+
         # DISTINCT ON (run_id) ... ORDER BY run_id, seq DESC gives the
         # newest event per run using the (run_id, seq) primary key index.
         #
@@ -98,6 +103,9 @@ class PostgresEventStore(EventStore):
     async def find_awaiting_approval(
         self, *, limit: int = 100
     ) -> list[tuple[UUID, ApprovalRequested]]:
+        if limit <= 0:
+            return []
+
         # Same DISTINCT ON trick as find_resumable_runs: newest row per
         # run_id off the (run_id, seq) primary key index, then keep only
         # the ones whose newest row actually is ApprovalRequested.

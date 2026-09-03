@@ -2,7 +2,7 @@ import pytest
 
 from durable_agents.events import ToolCallInvocation
 from durable_agents.guardrails.output_validate import validate_output
-from durable_agents.tools.refund_tools import InMemoryRefundBackend, build_refund_tools
+from refund_demo import InMemoryRefundBackend, build_refund_tools
 from durable_agents.tools.registry import Tool
 
 

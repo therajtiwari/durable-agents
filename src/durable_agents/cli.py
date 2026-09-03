@@ -3,25 +3,27 @@ import asyncio
 import os
 import sys
 from urllib.parse import urlsplit, urlunsplit
-from uuid import UUID, uuid4
+from uuid import UUID
 
-from durable_agents.events import LLMCallCompleted
-from durable_agents.llm.scripted import ScriptedLLM
 from durable_agents.orchestrator import Orchestrator
 from durable_agents.replay_view import Style, render, should_use_colour
 from durable_agents.state import rebuild_state
 from durable_agents.storage.postgres import PostgresEventStore
 from durable_agents.storage.schema import create_schema
 
-# OpenAICompatibleClient and the refund demo modules are imported inside
-# the two subcommands that use them, not here. The client pulls in httpx,
-# which lives in the optional "openai" extra — importing it at module
-# scope meant `pip install durable-agents` followed by
-# `durable-agents --help` died with ModuleNotFoundError, i.e. the entry
-# point every doc points at was broken on a plain install. The refund
-# modules are demo content that is due to move out of the package
-# entirely, and importing them here would take the whole CLI down with
-# them when they go.
+# OpenAICompatibleClient is imported inside the one subcommand that uses
+# it, not here. It pulls in httpx, which lives in the optional "openai"
+# extra — importing it at module scope meant `pip install
+# durable-agents` followed by `durable-agents --help` died with
+# ModuleNotFoundError, i.e. the entry point every doc points at was
+# broken on a plain install.
+#
+# Every subcommand here is generic. The fixed refund demo used to live
+# alongside them as `durable-agents demo`; it is now
+# examples/crash_resume_demo.py, since a library's console script has no
+# business shipping a scripted demo of someone else's domain — and it
+# could not have kept working anyway once the refund modules stopped
+# being part of the package.
 
 DEFAULT_DSN = "postgresql://durable_agents:durable_agents@localhost:5432/durable_agents"
 
@@ -72,43 +74,6 @@ async def _replay(run_id: UUID, dsn: str, *, colour: bool | None, show_thinking:
 
     style = Style.enabled() if should_use_colour(colour) else Style()
     print(render(run_id, events, rebuild_state(events), style, show_thinking))
-
-
-async def _demo(run_id: UUID, dsn: str) -> None:
-    """The zero-setup crash-resume proof: one fixed scripted conversation
-    against fake refund tools — no API key, no network call, nothing to
-    configure. Starting is just resuming from an empty log, same as
-    orchestrator.run() itself, so the same function handles both a fresh
-    run_id and one that already has events (e.g. was killed mid-flight)
-    — reconstructing ScriptedLLM's position from how many
-    LLMCallCompleted events already exist.
-
-    This is a fixed demo, not a way to run an arbitrary goal — see
-    `resume` for that.
-    """
-
-    from durable_agents.tools.refund_backend_postgres import PostgresRefundBackend
-    from durable_agents.tools.refund_demo_scenario import canonical_run_started, canonical_script
-    from durable_agents.tools.refund_tools import build_refund_tools
-
-    store = await PostgresEventStore.connect(dsn)
-    events = await store.read(run_id)
-
-    if not events:
-        await store.append(run_id, 0, canonical_run_started(requested_by="cli-demo"))
-        events = await store.read(run_id)
-
-    already_completed = sum(1 for e in events if isinstance(e, LLMCallCompleted))
-    llm = ScriptedLLM(canonical_script()[already_completed:])
-
-    backend = await PostgresRefundBackend.connect(dsn)
-    tools = {t.name: t for t in build_refund_tools(backend)}
-
-    orchestrator = Orchestrator(store=store, llm=llm, tools=tools)
-    final_state = await orchestrator.run(run_id)
-
-    print(f"Run {run_id}: {final_state.status}")
-    print(f"(see the full trace with: durable-agents replay {run_id})")
 
 
 async def _resume(run_id: UUID, dsn: str) -> None:
@@ -191,21 +156,6 @@ def main() -> None:
         "--dsn", default=os.environ.get("DATABASE_URL", DEFAULT_DSN)
     )
 
-    demo_parser = subparsers.add_parser(
-        "demo",
-        help="Run the zero-setup crash-resume demo (fixed scripted refund scenario)",
-    )
-    demo_parser.add_argument(
-        "run_id",
-        type=UUID,
-        nargs="?",
-        default=None,
-        help="Resume a demo run that was killed mid-flight; omit to start a new one",
-    )
-    demo_parser.add_argument(
-        "--dsn", default=os.environ.get("DATABASE_URL", DEFAULT_DSN)
-    )
-
     resume_parser = subparsers.add_parser(
         "resume",
         help="Resume ANY run with a real LLM (needs LLM_API_KEY; no tools wired up)",
@@ -229,11 +179,6 @@ def main() -> None:
                 show_thinking=args.thinking,
             )
         )
-    elif args.command == "demo":
-        run_id = args.run_id or uuid4()
-        if args.run_id is None:
-            print(f"Starting demo run {run_id}")
-        asyncio.run(_demo(run_id, args.dsn))
     elif args.command == "resume":
         asyncio.run(_resume(args.run_id, args.dsn))
 

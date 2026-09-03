@@ -949,7 +949,90 @@ was sent. The phone pattern now requires a dialable shape; verified
 against 7 real formats and 9 business identifiers, and the corpus
 numbers are unchanged.
 
-205/205 non-live tests, mypy clean (61 files).
+**The Linux question is answered, not deferred.** The whole suite was
+run in a Linux container against the compose Postgres rather than
+waiting on a first push: `SIGKILL: 9`, 205/205 passing, mypy clean.
+All 27 chaos tests pass with a real SIGKILL, including the 11 mid-batch
+kill points from Iteration 33 — the `getattr(signal, "SIGKILL",
+signal.SIGTERM)` fallback was never load-bearing there. Integration
+tests ran too (testcontainers via the mounted docker socket), so every
+job the CI linux leg will run has now run. Docker/deploy can start from
+a known-good platform.
+
+`tests/chaos/test_chaos.py` now reads `DATABASE_URL` instead of
+hardcoding `localhost`, which is what made running it elsewhere
+possible at all.
+
+205/205 non-live tests on both Windows and Linux, mypy clean (61 files).
+
+## Week 6, Day 3 (continued) — demo code out of the wheel (Iteration 36)
+
+The last item genuinely blocking a clean publish. `refund_tools.py`,
+`refund_demo_scenario.py` and `refund_backend_postgres.py` moved
+(`git mv`) from `src/durable_agents/tools/` to `examples/refund_demo/`,
+so none of them ship. Tests reach them via pytest's new
+`pythonpath = ["examples"]`; example scripts get `examples/` on
+`sys.path` for free. `mypy_path` and CI's type-check step both gained
+`examples`.
+
+`durable-agents demo` could not survive the move (the shipped CLI cannot
+import from `examples/`) and is now `examples/crash_resume_demo.py`,
+behaviour unchanged. The CLI is all generic commands now: `replay`,
+`init-db`, `resume`.
+
+All 27 chaos tests failed first — pytest's `pythonpath` doesn't reach
+spawned subprocesses, which is precisely the property that suite exists
+to test. `_run_scenario` now sets `PYTHONPATH` explicitly.
+
+`002_refund_ledger.sql` needed no decision after all: only
+`src/durable_agents` is packaged, so it was never in the wheel.
+
+Verified by rebuilding and inspecting the wheel — no file matching
+"refund", schema and licence still present — and CI's package job now
+fails if any reappears. 207/207 tests, mypy clean (73 files).
+
+## Week 6, Day 3 (continued) — adversarial QA (Iteration 37)
+
+A QA pass probing by execution rather than reading found 11 defects, all
+of which passed the full suite. Nine fixed; full detail in
+`docs/BUILD_LOG.md` iteration 37.
+
+**Critical, and it defeated the project's central guarantee.** A tool
+returning anything but a JSON-safe dict — a string, `None`, a list, a
+dict holding a `Decimal` or `datetime` — raised *after* the side effect
+had run. Nothing recorded the outcome, the log kept a dangling
+`ToolCallRequested`, and the Worker read that as unfinished: five polls
+meant five real emails from one requested action. Fixed with
+`normalize_tool_result`, which cannot raise by construction. Found while
+fixing it: **Postgres rejects `NaN`/`Infinity` in JSONB**, and the
+original probe had missed this because `InMemoryEventStore` stores
+Python objects and validates nothing about serialisation — there is now
+a Postgres integration test over every such value.
+
+**A wrong-typed tool argument used to end the run under every profile
+except `off`**, making the safety layer measurably worse than no safety
+layer for the most common tool-calling mistake. The call is still
+blocked and still recorded as `BLOCK`; the validation error now goes back
+to the model so it can correct itself.
+
+Also fixed: API input validation (unknown profile / empty goal /
+non-positive caps now 422 rather than a 201 followed by an unrunnable
+run); quadratic guardrail scanning (80 KB went from 7.5s to ~2ms, and it
+was blocking the event loop); negative `limit` silently hiding pending
+approvals; deterministic tool errors burning the retry budget; and tool
+signatures that produced broken schemas now rejected at registration.
+
+**Deliberately not fixed:** validating `rebuild_state` would make a
+corrupted log unreadable via `GET /runs/{id}` and `replay`, exactly when
+inspection matters most, for a problem the primary key already prevents.
+
+260/260 non-live tests on Windows and Linux, mypy clean (75 files).
+
+**Publishable once `schema_version` is decided** — and that decision is
+now "skip it, write the policy instead": absence already means version 1,
+so the field can be added at the moment it is ever needed. Everything
+else remaining (Docker, demo page, replay rollup, comparison table, GIF,
+video, blog) is post-publish discoverability work.
 
 **Should-fix set, still open:** event `schema_version` while no logs
 exist in the wild (worth a real decision — field defaults have already

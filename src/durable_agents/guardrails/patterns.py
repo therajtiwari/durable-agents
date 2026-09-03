@@ -113,7 +113,18 @@ class PIIPattern:
 # a consumer (or this project's own refund demo) adds those by passing
 # its own PIIPattern list, not by extending this default set.
 DEFAULT_PII_PATTERNS: list[PIIPattern] = [
-    PIIPattern("email", re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")),
+    # The leading lookbehind is a performance fix, not a semantic one: it
+    # matches exactly what the unanchored version did (verified against a
+    # correctness set), but stops the engine restarting the "+" at every
+    # position inside a long run of identifier characters and backtracking
+    # over it. Without it this was quadratic — a tool returning 80 KB of
+    # log or base64 took 7.5 seconds of pure CPU, synchronously, inside
+    # the event loop, stalling every other run the worker was handling.
+    # With it, the same input takes ~2 ms.
+    PIIPattern(
+        "email",
+        re.compile(r"(?<![a-zA-Z0-9._%+-])[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"),
+    ),
     PIIPattern("credit_card", re.compile(r"\b(?:\d[ -]?){13,19}\b"), validate=_credit_card_valid),
     PIIPattern("iban", re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{10,30}\b")),
     PIIPattern("phone", PHONE_PATTERN, validate=_phone_valid),

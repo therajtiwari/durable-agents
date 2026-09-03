@@ -12,7 +12,13 @@ from durable_agents.state import RunState, rebuild_state
 from durable_agents.storage.postgres import PostgresEventStore
 from durable_agents.tools.registry import idempotency_key
 
-DSN = "postgresql://durable_agents:durable_agents@localhost:5432/durable_agents"
+# Configurable for the same reason scenario_runner.py already reads it:
+# the suite spawns real separate processes that must all reach one
+# database, so it cannot use a testcontainer, and where that database
+# lives differs between a developer's machine, CI, and a container.
+DSN = os.environ.get(
+    "DATABASE_URL", "postgresql://durable_agents:durable_agents@localhost:5432/durable_agents"
+)
 RUNNER = str(Path(__file__).parent / "scenario_runner.py")
 
 # Matches tests/chaos/scenario_runner.py's canonical scripted scenario
@@ -25,10 +31,22 @@ ISSUE_REFUND_COMPLETE_SEQ = 12
 LAST_MEANINGFUL_KILL_SEQ = 14  # killing after 15 (RunCompleted) proves nothing
 
 
+EXAMPLES = str(Path(__file__).resolve().parents[2] / "examples")
+
+
 def _run_scenario(run_id: UUID, env_overrides: dict[str, str]) -> subprocess.CompletedProcess[bytes]:
+    # PYTHONPATH, not pytest's pythonpath setting: the runner is a
+    # genuinely separate process (that is the whole point of this suite),
+    # so it inherits none of pytest's sys.path manipulation and has to be
+    # told where the refund demo lives on its own.
+    existing = os.environ.get("PYTHONPATH")
     return subprocess.run(
         [sys.executable, RUNNER, str(run_id)],
-        env={**os.environ, **env_overrides},
+        env={
+            **os.environ,
+            "PYTHONPATH": f"{EXAMPLES}{os.pathsep}{existing}" if existing else EXAMPLES,
+            **env_overrides,
+        },
     )
 
 

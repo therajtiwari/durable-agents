@@ -223,8 +223,30 @@ weeks the log recorded a hash of a prompt that didn't exist anywhere.
 The validator only fills a hash that's absent, so events written before
 the field existed keep the hash they were stored with.
 
-**`durable-agents demo` and `durable-agents resume` are two different
-commands, not one.** They used to be the same command (`start`/`resume`
+**The refund scenario lives in `examples/refund_demo/`, not in the
+package.** Rejected: shipping it inside `src/durable_agents/tools/`,
+which is where it started. It is application code written *against* this
+runtime — a consumer installing durable-agents wants the `@tool`
+decorator and the orchestrator, not somebody else's refund tools, and
+`002_refund_ledger.sql` is demo schema for the same reason (it was never
+packaged, since only `src/durable_agents` is). It sits under
+`examples/` rather than `tests/` because both the suite and the example
+scripts need it, and an example importing from a test directory would be
+backwards. Tests reach it through pytest's `pythonpath = ["examples"]`;
+example scripts get it free, since running `python examples/foo.py` puts
+that directory on `sys.path`. The chaos suite sets `PYTHONPATH`
+explicitly for its subprocesses, which inherit none of that.
+
+**`durable-agents demo` was removed when that move happened**, and is now
+`examples/crash_resume_demo.py` with its behaviour unchanged. A library's
+console script has no business carrying a fixed demo of someone else's
+business domain, and the command could not have kept working once the
+code it depended on stopped shipping. What remains in the CLI —
+`replay`, `init-db`, `resume` — is all generic.
+
+**~~`durable-agents demo` and `durable-agents resume` are two different
+commands, not one.~~ Superseded by the move above; the reasoning below
+is why `resume` is generic today.** They used to be the same command (`start`/`resume`
 both called one shared `_start_or_resume`) which *always* wired up a
 hardcoded scripted refund conversation against fake refund tools —
 discovered as a real point of confusion when a user created a run with

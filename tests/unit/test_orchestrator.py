@@ -9,7 +9,7 @@ from durable_agents.llm.protocol import LLMResponse
 from durable_agents.llm.scripted import ScriptedLLM
 from durable_agents.orchestrator import Orchestrator
 from durable_agents.storage.memory import InMemoryEventStore
-from durable_agents.tools.refund_tools import InMemoryRefundBackend, build_refund_tools
+from refund_demo import InMemoryRefundBackend, build_refund_tools
 from durable_agents.tools.registry import Tool
 
 

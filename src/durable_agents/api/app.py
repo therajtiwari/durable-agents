@@ -3,10 +3,11 @@ from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
 
-from fastapi import Depends, FastAPI, HTTPException, Request
-from pydantic import BaseModel
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from pydantic import BaseModel, Field, field_validator
 
 from durable_agents.events import ApprovalDenied, ApprovalGranted, RunStarted
+from durable_agents.guardrails.decisions import get_profile
 from durable_agents.state import RunState, RunStatus, rebuild_state
 from durable_agents.storage.protocol import ConcurrencyConflict, EventStore
 
@@ -36,13 +37,32 @@ class RunStatusResponse(BaseModel):
 
 
 class StartRunRequest(BaseModel):
-    goal: str
-    requested_by: str = "unknown"
-    system_prompt: str = ""
-    model: str | None = None
-    max_steps: int | None = None
-    max_cost_usd: Decimal | None = None
+    """Validated here rather than at execution time, because a run is
+    recorded into an append-only log: a value accepted now can never be
+    corrected, and the run it produces fails on its first execution with
+    a reason ("max_steps_exceeded") describing a cap that was never
+    reachable. A 422 at submission is far kinder than a 201 followed by
+    a corpse.
+    """
+
+    goal: str = Field(min_length=1, max_length=100_000)
+    requested_by: str = Field(default="unknown", max_length=500)
+    system_prompt: str = Field(default="", max_length=100_000)
+    model: str | None = Field(default=None, max_length=200)
+    max_steps: int | None = Field(default=None, ge=1, le=10_000)
+    max_cost_usd: Decimal | None = Field(default=None, gt=0, le=Decimal("1000000"))
     guardrail_profile: str | None = None
+
+    @field_validator("guardrail_profile")
+    @classmethod
+    def _known_profile(cls, value: str | None) -> str | None:
+        # get_profile raises on an unknown name, but only when the run is
+        # executed — which for an API-created run is inside a worker,
+        # where it fails on every poll forever, logging a stack trace
+        # each time and never reaching a terminal state.
+        if value is not None:
+            get_profile(value)
+        return value
 
 
 class ApproveRequest(BaseModel):
@@ -128,7 +148,7 @@ def create_app(
 
     @app.get("/approvals", response_model=list[PendingApprovalListItem])
     async def list_pending_approvals(
-        limit: int = 100,
+        limit: int = Query(default=100, ge=1, le=1000),
         store: EventStore = Depends(get_store),
     ) -> list[PendingApprovalListItem]:
         # An approver's dashboard needs to discover what needs a

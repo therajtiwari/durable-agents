@@ -1,6 +1,6 @@
 import pytest
 
-from durable_agents.tools.refund_tools import InMemoryRefundBackend, build_refund_tools
+from refund_demo import InMemoryRefundBackend, build_refund_tools
 
 
 @pytest.mark.asyncio

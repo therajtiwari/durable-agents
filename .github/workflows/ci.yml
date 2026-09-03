@@ -69,7 +69,7 @@ jobs:
             -f db/migrations/002_refund_ledger.sql
 
       - name: Type check
-        run: uv run mypy --strict src tests
+        run: uv run mypy --strict src tests examples
 
       - name: Test
         # Everything: unit, integration (its own testcontainer), and the
@@ -93,7 +93,7 @@ jobs:
         run: uv sync --python 3.12
 
       - name: Type check
-        run: uv run mypy --strict src tests
+        run: uv run mypy --strict src tests examples
 
       - name: Test (unit only)
         # No Docker on the Windows runners, so the integration suite
@@ -134,12 +134,18 @@ jobs:
           }
           missing = [what for what, part in required.items() if not any(part in n for n in names)]
           leftover = [n for n in names if n.endswith(("anthropic_client.py", "llm/replay.py"))]
+          # The refund scenario is application code written against this
+          # runtime, not part of it. It lives in examples/refund_demo/ and
+          # must never creep back into the wheel.
+          demo = [n for n in names if "refund" in n.lower()]
 
           for what in missing:
               print(f"MISSING from wheel: {what}", file=sys.stderr)
           for n in leftover:
               print(f"empty stub module shipped: {n}", file=sys.stderr)
-          sys.exit(1 if missing or leftover else 0)
+          for n in demo:
+              print(f"demo code shipped: {n}", file=sys.stderr)
+          sys.exit(1 if missing or leftover or demo else 0)
           PY
 
   quickstart:

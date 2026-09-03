@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel, create_model
+from pydantic import BaseModel, ConfigDict, create_model
 
 
 @dataclass(frozen=True)
@@ -35,6 +35,13 @@ def _build_parameters_model(func: Callable[..., Awaitable[Any]]) -> type[BaseMod
     hints. Excludes a parameter literally named idempotency_key: that
     value is computed and injected by the orchestrator, never something
     the model should see as a field to fill in or invent.
+
+    Rejects signatures that cannot produce a usable JSON schema. All of
+    these previously succeeded and shipped something broken to the
+    provider, which is a much worse failure than a loud one here: the
+    tool looks registered, the model is handed nonsense, and the mistake
+    surfaces as a confusing provider error or a hallucinated argument
+    mid-run.
     """
 
     signature = inspect.signature(func)
@@ -42,11 +49,51 @@ def _build_parameters_model(func: Callable[..., Awaitable[Any]]) -> type[BaseMod
     for name, param in signature.parameters.items():
         if name == "idempotency_key":
             continue
-        annotation = param.annotation if param.annotation is not inspect.Parameter.empty else Any
-        default = param.default if param.default is not inspect.Parameter.empty else ...
-        fields[name] = (annotation, default)
 
-    model: type[BaseModel] = create_model(func.__name__, **fields)
+        if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+            # *args became a single scalar field named "args" and
+            # **kwargs one named "kwargs" — schemas the model would
+            # dutifully try to fill with a value that means nothing.
+            raise ValueError(
+                f"tool {func.__name__!r} cannot use *{name}: a tool's arguments have to be "
+                f"named for the model to fill them in. Declare each parameter explicitly."
+            )
+
+        if name.startswith("model_"):
+            # create_model treats these as Pydantic's own configuration,
+            # and model_config in particular failed with
+            # "TypeError: 'ellipsis' object is not iterable" — an error
+            # naming nothing the caller wrote.
+            raise ValueError(
+                f"tool {func.__name__!r} cannot have a parameter named {name!r}: names "
+                f"beginning with 'model_' are reserved by Pydantic. Rename the parameter."
+            )
+
+        if param.annotation is inspect.Parameter.empty:
+            # Produced {"title": "X"} with no "type" at all. Some
+            # providers reject a typeless property outright; the rest
+            # leave the model guessing.
+            raise ValueError(
+                f"tool {func.__name__!r} is missing a type annotation for {name!r}. The "
+                f"parameter's type is what tells the model what to send."
+            )
+
+        default = param.default if param.default is not inspect.Parameter.empty else ...
+        fields[name] = (param.annotation, default)
+
+    # extra="forbid" so an argument the function does not accept is caught
+    # by validation instead of at call time. It used to reach
+    # execute(**kwargs), raise TypeError("unexpected keyword argument"),
+    # and then be retried the full three times with backoff — a
+    # deterministic failure treated as a transient one. Retrying every
+    # exception is right for provider errors, but a wrong keyword is
+    # knowably not one.
+    #
+    # It also puts "additionalProperties": false in the JSON schema,
+    # which tells the provider not to invent fields in the first place.
+    model: type[BaseModel] = create_model(
+        func.__name__, __config__=ConfigDict(extra="forbid"), **fields
+    )
     return model
 
 

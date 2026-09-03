@@ -65,12 +65,21 @@ class InMemoryEventStore(EventStore):
                     continue
             candidates.append((latest.created_at, run_id))
 
+        if limit <= 0:
+            return []
         candidates.sort(key=lambda pair: pair[0])
         return [run_id for _, run_id in candidates[:limit]]
 
     async def find_awaiting_approval(
         self, *, limit: int = 100
     ) -> list[tuple[UUID, ApprovalRequested]]:
+        # A negative limit used to reach a list slice, where [:-1] quietly
+        # drops the last row instead of erroring — so a caller that
+        # miscomputed a limit silently hid pending approvals from the
+        # humans meant to act on them.
+        if limit <= 0:
+            return []
+
         candidates: list[tuple[datetime, UUID, ApprovalRequested]] = []
 
         for run_id, events in self._events.items():

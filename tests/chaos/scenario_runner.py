@@ -21,14 +21,14 @@ from durable_agents.events import LLMCallCompleted
 from durable_agents.llm.scripted import ScriptedLLM
 from durable_agents.orchestrator import Orchestrator
 from durable_agents.storage.postgres import PostgresEventStore
-from durable_agents.tools.refund_backend_postgres import PostgresRefundBackend
-from durable_agents.tools.refund_demo_scenario import (
+from refund_demo import (
+    PostgresRefundBackend,
+    build_refund_tools,
     canonical_run_started,
     canonical_script,
     parallel_refund_script,
     parallel_run_started,
 )
-from durable_agents.tools.refund_tools import build_refund_tools
 
 DSN = os.environ.get(
     "DATABASE_URL", "postgresql://durable_agents:durable_agents@localhost:5432/durable_agents"

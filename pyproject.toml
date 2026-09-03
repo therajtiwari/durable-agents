@@ -63,11 +63,16 @@ strict = true
 # and tests/live/test_live_llm.py import their sibling "corpus"/
 # "conftest" modules with a bare `from corpus import ...` — mypy needs
 # telling separately since it doesn't replicate that runtime behavior.
-mypy_path = "src:tests/guardrails:tests/live"
+mypy_path = "src:examples:tests/guardrails:tests/live"
 explicit_package_bases = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "strict"
+# The refund demo lives in examples/ rather than the package, so it does
+# not ship in the wheel. Tests need it (it is the scenario most of them
+# exercise) and so do the example scripts, which get examples/ on
+# sys.path for free by being run from there.
+pythonpath = ["examples"]
 markers = [
     "live: hits a real LLM provider over the network; costs real API quota. Never runs by default — explicitly with `pytest -m live tests/live`.",
 ]

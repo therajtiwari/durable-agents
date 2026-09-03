@@ -22,7 +22,7 @@ from durable_agents.guardrails.input_scan import scan_input
 from durable_agents.guardrails.output_validate import validate_output
 from durable_agents.guardrails.tool_result_scan import scan_tool_result
 from durable_agents.guardrails.types import GuardMatch
-from durable_agents.tools.refund_tools import InMemoryRefundBackend, build_refund_tools
+from refund_demo import InMemoryRefundBackend, build_refund_tools
 from durable_agents.tools.registry import Tool
 
 _SEVERITY = {"ALLOW": 0, "REDACT": 1, "ESCALATE": 2, "BLOCK": 3}

@@ -3167,6 +3167,214 @@ of which are now parametrised tests.
 The corpus numbers are unchanged, which is the point: the one real phone
 case in it is still caught.
 
+### The Linux run, actually done
+
+Rather than wait for a first push to answer it, the suite was run inside
+a Linux container against the compose Postgres:
+
+```
+Linux 6.6.87.2-microsoft-standard-WSL2 x86_64
+SIGKILL: 9
+...
+205 passed, 2 deselected
+mypy --strict: Success, 61 source files
+```
+
+So the answer to six weeks of "the chaos suite has only ever taken the
+Windows path" is: **nothing was hiding there.** `signal.SIGKILL` exists,
+the `getattr(signal, "SIGKILL", signal.SIGTERM)` fallback was never
+load-bearing on Linux, and all 27 chaos tests — including the 11
+mid-batch kill points added in Iteration 33 — pass with a real SIGKILL.
+The integration suite ran too (testcontainers, via the mounted docker
+socket), so this exercised every job the CI workflow's linux leg will.
+
+That is a boring result and a valuable one: the Dockerfile work can now
+start from a known-good platform rather than debugging two unknowns at
+once.
+
+One change fell out of doing it. `tests/chaos/test_chaos.py` hardcoded
+its DSN to `localhost`, so the suite could only run where Postgres
+happened to sit on the host. It now reads `DATABASE_URL` with that value
+as the default — mirroring what `scenario_runner.py` already did, and
+the reason the suite cannot use a testcontainer in the first place
+(genuinely separate processes must all reach one database).
+
 **Full regression:** `mypy --strict` clean (61 files), 205/205 non-live
-tests (13 new), wheel built and inspected, clean-install quickstart and
-console script verified by hand on the wheel.
+tests (13 new), on **both Windows and Linux**. Wheel built and
+inspected; clean-install quickstart and console script verified by hand
+on the wheel.
+
+## Iteration 36 — the refund demo leaves the package
+
+The last thing standing between here and a publishable wheel. Three
+modules — `refund_tools.py`, `refund_demo_scenario.py`,
+`refund_backend_postgres.py` — sat in `src/durable_agents/tools/` and
+therefore shipped to anyone who installed the library. They are
+application code written *against* this runtime, not part of it: a
+consumer wants the `@tool` decorator and the orchestrator, not somebody
+else's refund tools.
+
+Moved with `git mv` to `examples/refund_demo/` as a small package, so
+history follows them.
+
+### Why examples/ and not tests/
+
+Six test files and one example script import this code. Putting it under
+`tests/` would mean an example importing from a test directory, which is
+backwards. Under `examples/` both work:
+
+- example scripts run as `python examples/foo.py`, which puts
+  `examples/` on `sys.path` for free
+- tests reach it through pytest's new `pythonpath = ["examples"]`
+
+`mypy_path` gained `examples` too, and CI now type-checks
+`src tests examples` rather than `src tests` — this is real code the
+suite depends on, and it was previously unchecked as a directory.
+
+### What broke, and the interesting reason
+
+All 27 chaos tests failed on the first run:
+`ModuleNotFoundError: No module named 'refund_demo'`.
+
+pytest's `pythonpath` applies to the pytest process. The chaos suite's
+whole point is that it spawns *genuinely separate* OS processes, which
+inherit none of that. `_run_scenario` now sets `PYTHONPATH` explicitly
+in the subprocess environment. A good failure: the fix is one line, and
+the reason it happened is the exact property the suite exists to test.
+
+### `durable-agents demo` is gone
+
+It could not have survived — the shipped CLI cannot import from
+`examples/`. Rather than delete the capability it became
+`examples/crash_resume_demo.py`, behaviour unchanged. That is the right
+home regardless: a library's console script should not carry a fixed
+demo of someone else's business domain. What remains — `replay`,
+`init-db`, `resume` — is all generic.
+
+`DECISIONS.md`'s old entry explaining the `demo`/`resume` split is
+marked superseded rather than deleted, since the reasoning is still why
+`resume` is generic today.
+
+### Verified, not assumed
+
+The wheel was rebuilt and inspected: **no file matching "refund"**, 29
+modules, schema and licence still present. CI's package job now fails on
+any refund file reappearing, alongside the existing checks. Two new
+tests assert the demo code is not importable from the installed package
+under any name it has had, and that `--help` no longer offers `demo`
+while still offering the three generic commands.
+
+`examples/quickstart.py` still runs, and `import refund_demo` resolves
+from `examples/` without installation.
+
+**Full regression:** `mypy --strict` clean (73 files, up from 61 now
+that examples are checked), 207/207 non-live tests.
+
+## Iteration 37 — adversarial QA, and the bug that defeated the whole point
+
+An adversarial QA pass — probing by execution rather than reading —
+produced eleven defects, every one of which passed the full suite. Nine
+are fixed here.
+
+### The critical one
+
+`ToolCallCompleted.result` is `dict[str, Any]`, and the result is also
+put through `json.dumps`. A tool returning anything else — a string,
+`None`, a list, a dict holding a `Decimal` or a `datetime` — raised
+*after* `execute()` had already run. The exception escaped `run()`, so
+nothing recorded the outcome; the log kept a dangling
+`ToolCallRequested`, which is precisely the signal a Worker reads as
+"unfinished".
+
+```
+a tool that sends an email and returns None
+poll 1: emails actually sent = 1
+poll 2: emails actually sent = 2
+...
+poll 5: emails actually sent = 5      one requested action
+```
+
+Unbounded repetition of a real side effect: the exact failure this
+project exists to prevent. The idempotency key normally makes a repeat
+safe, but it is only passed to tools that *declare* the parameter — and
+a tool returning `None` is precisely the kind that does not.
+
+**Found while fixing it:** Postgres rejects `NaN` and `Infinity` in
+JSONB outright. The original probe had reported the NaN case as
+"completed" because it ran against `InMemoryEventStore`, which stores
+Python objects and validates nothing about serialisation. So the
+in-memory store was concealing a whole class of failure, and there is
+now a Postgres integration test parametrised over every one of these
+values.
+
+`normalize_tool_result` converts whatever came back into a recordable
+dict: non-dicts wrapped as `{"result": ...}`, non-finite floats and
+`Decimal`/`datetime`/`bytes`/anything else rendered as strings, non-string
+keys stringified, depth capped so a cyclic or deeply nested result
+degrades rather than exhausting the stack. It is written so that it
+cannot raise, because it runs after a side effect: a result that cannot
+be represented faithfully is recorded approximately, and the run
+continues. Deliberately no event-schema change — the wrapping happens at
+the boundary, so every existing log rebuilds identically.
+
+### A model getting an argument wrong stopped being fatal
+
+`schema_invalid` mapped to `BLOCK` under every profile, so the single
+most common tool-calling mistake killed the run:
+
+```
+model sends n="oops", then corrects itself to n=5 next turn
+validation → failed      standard → failed      strict → failed
+off        → completed   answer='recovered'
+```
+
+The safety layer was measurably *worse than no safety layer*. The tool
+call is still blocked and the `GuardrailTriggered` event still records
+`BLOCK` truthfully — what changed is that the validation error is handed
+back to the model as a tool result, so it can correct itself, bounded by
+`max_steps` like any other loop. A violation of anything else — an
+unregistered tool, a policy cap actually exceeded, a real loop — still
+ends the run, because continuing there is the unsafe direction.
+
+### The rest
+
+- **Input validation at the API.** An unknown `guardrail_profile` was
+  accepted (201) and then failed inside the worker on every poll forever,
+  never reaching a terminal state. Empty goals and non-positive caps
+  produced runs that were dead on arrival. All now 422 at submission,
+  which matters more than usual here: a value accepted into an
+  append-only log can never be corrected.
+- **Guardrail scanning was quadratic.** The email pattern backtracked
+  across long runs of identifier characters: 80 KB took 7.5 seconds of
+  CPU, synchronously, inside the event loop — stalling every other run a
+  worker was handling. A leading lookbehind fixed it to ~2 ms, verified
+  to match exactly what the unanchored version matched. The QA report had
+  recommended capping the scanned length; that would have left PII past
+  the cap unredacted, so this is strictly better than the proposed fix.
+  Corpus numbers are unchanged.
+- **A negative `limit` silently hid pending approvals** — `[:-1]` drops
+  the last row rather than erroring, on the queue humans use to find
+  work. Bounded at the endpoint and guarded in both stores.
+- **Deterministic tool errors burned the retry budget.** An argument the
+  function does not accept now fails validation instead of reaching
+  `execute(**kwargs)`, raising `TypeError`, and being retried three times
+  with backoff. `extra="forbid"` also puts `additionalProperties: false`
+  in the schema, telling the provider not to invent fields.
+- **Tool signatures that produced broken schemas are rejected at
+  registration**: `*args`/`**kwargs` (rendered as meaningless scalar
+  fields), parameters named `model_*` (which failed with "TypeError:
+  'ellipsis' object is not iterable", naming nothing the caller wrote),
+  and missing type annotations (a property with no `type` at all).
+
+### Deliberately not fixed
+
+`rebuild_state` accepts impossible logs and silently miscounts —
+duplicate events double-count cost, a second `RunStarted` discards
+history. Adding validation would make a corrupted log **unreadable**:
+`GET /runs/{id}` and `replay` would both raise, exactly when someone most
+needs to inspect the run. Postgres's `(run_id, seq)` primary key already
+prevents duplicates and reordering in practice. Low severity, real
+downside, and it is the purest function in the codebase.
+
+**Full regression:** `mypy --strict` clean (75 files), 260/260 non-live
+tests (31 new), on both Windows and Linux, against real Postgres.

@@ -11,6 +11,7 @@ These tests check the import graph rather than behaviour, since that is
 where the defect lives.
 """
 
+import importlib
 import subprocess
 import sys
 
@@ -48,15 +49,37 @@ def test_cli_does_not_import_optional_extras_at_module_scope(optional: str) -> N
     assert optional not in _imports_after("durable_agents.cli")
 
 
-@pytest.mark.parametrize("demo", ["refund_tools", "refund_demo_scenario", "refund_backend_postgres"])
-def test_cli_does_not_import_demo_modules_at_module_scope(demo: str) -> None:
-    """The refund modules are demo content, due to move out of the
-    shipped package. Importing them at module scope would take the whole
-    CLI down with them when they go — including `replay`, which has
-    nothing to do with the demo.
+@pytest.mark.parametrize(
+    "demo", ["refund_tools", "refund_demo_scenario", "refund_backend_postgres", "refund_demo"]
+)
+def test_the_package_ships_no_refund_demo_code(demo: str) -> None:
+    """The refund scenario is application code written against this
+    runtime, not part of it. It lives in examples/refund_demo/ and must
+    not be importable from the installed package under any of the names
+    it has had — a consumer installing durable-agents wants the @tool
+    decorator and the orchestrator, not somebody else's refund tools.
     """
 
-    assert f"durable_agents.tools.{demo}" not in _imports_after("durable_agents.cli")
+    with pytest.raises(ImportError):
+        importlib.import_module(f"durable_agents.tools.{demo}")
+
+
+def test_cli_offers_only_generic_commands() -> None:
+    """`demo` was a subcommand until the refund modules left the
+    package. A library's console script should not carry a fixed demo of
+    someone else's business domain; that lives in
+    examples/crash_resume_demo.py now.
+    """
+
+    result = subprocess.run(
+        [sys.executable, "-m", "durable_agents.cli", "--help"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "demo" not in result.stdout
+    for generic in ("replay", "init-db", "resume"):
+        assert generic in result.stdout
 
 
 def test_importing_the_package_does_not_require_any_extra() -> None:
