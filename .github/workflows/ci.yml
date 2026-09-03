@@ -6,6 +6,13 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Least privilege: this workflow only reads the repo and runs tests, so
+# the default GITHUB_TOKEN gets no write access anywhere. A fork's pull
+# request already gets a read-only token from GitHub regardless; this
+# makes that true for a push from this repo too.
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -21,6 +28,7 @@ jobs:
   linux:
     name: linux · py${{ matrix.python }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -76,11 +84,19 @@ jobs:
         # chaos suite. This is the first time the chaos suite runs on
         # Linux at all — it branches on getattr(signal, "SIGKILL", ...),
         # so every previous run took the Windows TerminateProcess path.
+        #
+        # DATABASE_URL is set explicitly rather than relied on matching
+        # test_chaos.py's own hardcoded default by coincidence — the
+        # chaos suite spawns real subprocesses against a fixed DSN, so
+        # this is the actual connection string in use, not a fallback.
+        env:
+          DATABASE_URL: postgresql://durable_agents:durable_agents@localhost:5432/durable_agents
         run: uv run pytest -q
 
   windows:
     name: windows · py3.12
     runs-on: windows-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -107,6 +123,7 @@ jobs:
   package:
     name: package
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -151,6 +168,7 @@ jobs:
   quickstart:
     name: quickstart runs from a clean install
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
