@@ -52,6 +52,15 @@ durable-agents = "durable_agents.cli:main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/durable_agents"]
 
+[tool.hatch.build.targets.sdist]
+# hatchling's default sdist is "everything not gitignored" — without
+# this it silently carried the internal build diary (PROGRESS.md,
+# docs/BUILD_LOG.md), CLAUDE.md, examples/, tests/, .env.example, and
+# .github/ onto PyPI's own "Download files" page, in a file most tools
+# never even inspect. The wheel was already this narrow; the sdist just
+# never had a rule.
+include = ["src", "LICENSE", "README.md", "pyproject.toml"]
+
 [tool.mypy]
 strict = true
 # explicit_package_bases (+ these extra roots) lets mypy tell apart
