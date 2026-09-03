@@ -3075,3 +3075,98 @@ in place with a comment naming it as a known wart, tracked separately.
 tests (9 new), wheel built and inspected. The PII tests were confirmed
 red against the old payload shape first; `patterns.py` was diffed
 byte-identical against a backup afterwards.
+
+## Iteration 35 — CI, and the packaging bug it found before it ever ran
+
+Chosen ahead of the Dockerfile deliberately: the chaos suite branches on
+`getattr(signal, "SIGKILL", signal.SIGTERM)`, so six weeks of real
+process-kill testing had only ever exercised the Windows
+`TerminateProcess` path. Docker is Linux. Finding a Linux problem in a
+clean CI run is much cheaper than finding it while debugging a
+Dockerfile and not knowing which layer is at fault.
+
+### The workflow
+
+Four jobs in `.github/workflows/ci.yml`:
+
+- **linux**, 3.12 and 3.13, with a `postgres:16` service on 5432 whose
+  credentials match the chaos suite's hardcoded DSN (chaos spawns real
+  separate processes, so it cannot use a testcontainer the way the
+  integration suite does). Applies both migrations, then `mypy --strict`
+  and the whole suite.
+- **windows**, unit tests only — the runners have no Docker, so neither
+  the integration nor the chaos suite can run there. What this adds is
+  that the pure-logic suite and the type checker stay green on the
+  platform most contributors are not using.
+- **package**, which builds the wheel and asserts it contains the
+  schema, the licence, the entry points and `py.typed`, and that the
+  deleted stub modules have not come back. Every one of those has been
+  missing from a build at some point in this project's history, and a
+  green test suite says nothing about any of them.
+- **quickstart**, which installs *only the built wheel* into a bare venv
+  — no dev group, no extras — and runs the README's own example plus the
+  console script, the way a stranger gets it.
+
+Nothing sets `LLM_API_KEY`, and `pyproject`'s `addopts` already excludes
+the live tier, so CI cannot spend API quota.
+
+### What the quickstart job found immediately
+
+Running it locally before committing the workflow:
+
+```
+$ durable-agents --help
+ModuleNotFoundError: No module named 'httpx'
+```
+
+`cli.py` imported `OpenAICompatibleClient` at module scope, which imports
+`httpx`, which is in the optional `openai` extra. So `pip install
+durable-agents` produced a console script that died on `--help` — the
+entry point every document points at, broken on a plain install, and
+invisible to 192 passing tests because the dev environment has httpx.
+
+This is a worse version of the audit's finding 11, which had only
+identified the demo modules. Both are fixed the same way: the optional
+client and the three refund demo modules are imported inside the two
+subcommands that use them. A missing extra now prints
+`pip install 'durable-agents[openai]'` instead of a traceback.
+
+`tests/unit/test_cli_packaging.py` locks it in by inspecting the import
+graph rather than behaviour — importing `durable_agents.cli` in a fresh
+interpreter and asserting `httpx`, `fastapi`, `uvicorn` and the three
+refund modules are absent from `sys.modules`.
+
+### A second bug, found by a test written for the first
+
+`redact_dsn` (Iteration 34) had a hole. `urlsplit` does not raise on a
+malformed connection string: given `postgres//user:hunter2@host/db` it
+reports no netloc and no password, so the function returned the input
+unchanged — printing the password in full, which is the one thing it
+exists to prevent. The `except ValueError` fallback never fired because
+nothing ever raised. Now a visible `@` with nothing parsed around it is
+treated as unparseable rather than as password-free.
+
+### The phone pattern
+
+Folded in because it is the same shape of defect: silent and
+data-dependent. The pattern matched any run of 10-15 digits, so it ate
+ordinary business identifiers and put `<PHONE_1>` in what the model was
+sent — the agent asks about order 1234567890123, the model sees a
+placeholder, and nothing reports an error. Four of five sampled business
+identifiers were false positives.
+
+Removing phone detection was considered and rejected: a real phone
+number in a tool result would then reach the provider, which is the leak
+the feature exists to prevent. Instead the shape now has to look
+dialable — an international `+` prefix, or digits genuinely grouped by
+separators — with lookarounds stopping it from starting or ending inside
+a longer identifier, or matching a window inside a run of unrelated
+numbers. Verified against 7 real formats and 9 business identifiers, all
+of which are now parametrised tests.
+
+The corpus numbers are unchanged, which is the point: the one real phone
+case in it is still caught.
+
+**Full regression:** `mypy --strict` clean (61 files), 205/205 non-live
+tests (13 new), wheel built and inspected, clean-install quickstart and
+console script verified by hand on the wheel.

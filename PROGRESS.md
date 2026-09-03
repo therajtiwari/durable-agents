@@ -916,14 +916,50 @@ bundled 80-case corpus:
 | `standard` | 0% | 20% | previous default |
 | `strict` | 0% | 25% | |
 
+## Week 6, Day 3 (continued) — CI (Iteration 35)
+
+Sequenced ahead of the Dockerfile on purpose: the chaos suite branches
+on `getattr(signal, "SIGKILL", signal.SIGTERM)` and had never run on
+Linux, which is what Docker is.
+
+`.github/workflows/ci.yml` — four jobs: **linux** (3.12/3.13, a
+`postgres:16` service matching the chaos suite's fixed DSN, both
+migrations, `mypy --strict` + full suite), **windows** (unit only; the
+runners have no Docker), **package** (builds the wheel and asserts the
+schema, licence, entry points and `py.typed` are in it and the deleted
+stubs are not), and **quickstart** (installs *only the wheel* into a
+bare venv and runs the README example plus the console script).
+
+**The quickstart job found a real bug before CI ever ran.**
+`durable-agents --help` failed on a clean install with
+`ModuleNotFoundError: No module named 'httpx'` — `cli.py` imported
+`OpenAICompatibleClient` at module scope, and httpx is in the optional
+`openai` extra. The documented entry point was broken for anyone who
+ran plain `pip install durable-agents`, and 192 passing tests could not
+see it because the dev environment has httpx. Fixed by importing the
+client and the three refund demo modules inside the subcommands that
+use them, which also closes audit finding 11.
+
+Two more caught in the same pass: `redact_dsn` returned malformed
+connection strings unchanged (so `postgres//user:pw@host/db` printed
+the password — `urlsplit` does not raise on it, so the fallback never
+fired), and the phone PII pattern matched any 10-15 digit run, silently
+replacing order and invoice numbers with `<PHONE_1>` in what the model
+was sent. The phone pattern now requires a dialable shape; verified
+against 7 real formats and 9 business identifiers, and the corpus
+numbers are unchanged.
+
+205/205 non-live tests, mypy clean (61 files).
+
 **Should-fix set, still open:** event `schema_version` while no logs
-exist in the wild; demo `policy_caps` still hardcoded into the shipped
-profiles (deliberately left — there is no configuration path for
-supplying your own yet, so emptying them would delete a documented
-check rather than fix the bias); a REDACT verdict on injection that
-redacts nothing; no CI at all; `cli.py` importing demo modules at
-module scope; cap checks running before the in-flight check; the loose
-phone pattern that masks 13-digit order IDs.
+exist in the wild (worth a real decision — field defaults have already
+carried three additive schema changes cleanly, so this is less urgent
+than the audit implied; it buys the non-additive cases); demo
+`policy_caps` still hardcoded into the shipped profiles (deliberately
+left — there is no configuration path for supplying your own yet, so
+emptying them would delete a documented check rather than fix the
+bias); a REDACT verdict on injection that redacts nothing; cap checks
+running before the in-flight check.
 
 Then Docker/deploy and Phase 4.
 

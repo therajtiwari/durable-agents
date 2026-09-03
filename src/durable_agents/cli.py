@@ -6,16 +6,22 @@ from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
 from durable_agents.events import LLMCallCompleted
-from durable_agents.llm.openai_compatible import OpenAICompatibleClient
 from durable_agents.llm.scripted import ScriptedLLM
 from durable_agents.orchestrator import Orchestrator
 from durable_agents.replay_view import Style, render, should_use_colour
 from durable_agents.state import rebuild_state
 from durable_agents.storage.postgres import PostgresEventStore
 from durable_agents.storage.schema import create_schema
-from durable_agents.tools.refund_backend_postgres import PostgresRefundBackend
-from durable_agents.tools.refund_demo_scenario import canonical_run_started, canonical_script
-from durable_agents.tools.refund_tools import build_refund_tools
+
+# OpenAICompatibleClient and the refund demo modules are imported inside
+# the two subcommands that use them, not here. The client pulls in httpx,
+# which lives in the optional "openai" extra — importing it at module
+# scope meant `pip install durable-agents` followed by
+# `durable-agents --help` died with ModuleNotFoundError, i.e. the entry
+# point every doc points at was broken on a plain install. The refund
+# modules are demo content that is due to move out of the package
+# entirely, and importing them here would take the whole CLI down with
+# them when they go.
 
 DEFAULT_DSN = "postgresql://durable_agents:durable_agents@localhost:5432/durable_agents"
 
@@ -35,6 +41,15 @@ def redact_dsn(dsn: str) -> str:
         parts = urlsplit(dsn)
     except ValueError:
         return dsn.rsplit("@", 1)[-1]
+
+    # urlsplit does not raise on a malformed connection string — given
+    # "postgres//user:pw@host/db" (one slash missing) it happily reports
+    # no netloc and no password, and returning the input unchanged would
+    # then print the password in full. A visible "@" with nothing parsed
+    # around it means the structure is not what it looks like, so drop
+    # everything before it rather than trusting the parse.
+    if not parts.netloc:
+        return dsn.rsplit("@", 1)[-1] if "@" in dsn else dsn
 
     if parts.password is None:
         return dsn
@@ -72,6 +87,10 @@ async def _demo(run_id: UUID, dsn: str) -> None:
     `resume` for that.
     """
 
+    from durable_agents.tools.refund_backend_postgres import PostgresRefundBackend
+    from durable_agents.tools.refund_demo_scenario import canonical_run_started, canonical_script
+    from durable_agents.tools.refund_tools import build_refund_tools
+
     store = await PostgresEventStore.connect(dsn)
     events = await store.read(run_id)
 
@@ -107,6 +126,12 @@ async def _resume(run_id: UUID, dsn: str) -> None:
     tools needs a real script wired against Runtime/Orchestrator
     directly — see README.md's "Bring your own model" section.
     """
+
+    try:
+        from durable_agents.llm.openai_compatible import OpenAICompatibleClient
+    except ImportError as exc:
+        print(f"This command needs the 'openai' extra: pip install 'durable-agents[openai]'  ({exc})")
+        sys.exit(1)
 
     api_key = os.environ.get("LLM_API_KEY")
     if not api_key:

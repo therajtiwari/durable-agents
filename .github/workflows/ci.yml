@@ -1,0 +1,168 @@
+name: CI
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Live tests are excluded by pyproject's addopts (-m 'not live') and
+  # nothing here sets LLM_API_KEY, so CI never spends API quota. Not
+  # relying on that alone would mean a key in repository secrets, which
+  # is a thing to avoid rather than manage.
+  UV_FROZEN: "1"
+
+jobs:
+  linux:
+    name: linux · py${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+
+    services:
+      # The chaos suite connects to a fixed DSN on localhost:5432 rather
+      # than a testcontainer, because it spawns genuinely separate OS
+      # processes that must all reach the same database. Credentials
+      # match tests/chaos/test_chaos.py's hardcoded DSN.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: durable_agents
+          POSTGRES_PASSWORD: durable_agents
+          POSTGRES_DB: durable_agents
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U durable_agents"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --python ${{ matrix.python }}
+
+      - name: Apply migrations
+        # Both files: the chaos suite asserts on refund_ledger, which
+        # 002 creates and the packaged schema deliberately does not
+        # (demo tables don't belong in the runtime schema).
+        env:
+          PGPASSWORD: durable_agents
+        run: |
+          psql -h localhost -U durable_agents -d durable_agents -v ON_ERROR_STOP=1 \
+            -f db/migrations/001_events_table.sql
+          psql -h localhost -U durable_agents -d durable_agents -v ON_ERROR_STOP=1 \
+            -f db/migrations/002_refund_ledger.sql
+
+      - name: Type check
+        run: uv run mypy --strict src tests
+
+      - name: Test
+        # Everything: unit, integration (its own testcontainer), and the
+        # chaos suite. This is the first time the chaos suite runs on
+        # Linux at all — it branches on getattr(signal, "SIGKILL", ...),
+        # so every previous run took the Windows TerminateProcess path.
+        run: uv run pytest -q
+
+  windows:
+    name: windows · py3.12
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --python 3.12
+
+      - name: Type check
+        run: uv run mypy --strict src tests
+
+      - name: Test (unit only)
+        # No Docker on the Windows runners, so the integration suite
+        # (testcontainers) and the chaos suite (a fixed-DSN Postgres)
+        # cannot run here. Windows is where this is developed, so those
+        # get exercised locally; what CI adds on this platform is that
+        # the pure-logic suite and the type checker stay green on the
+        # OS most of the project's contributors are not using.
+        run: uv run pytest tests/unit -q
+
+  package:
+    name: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Build wheel
+        run: uv build --wheel
+
+      - name: Check the wheel contains what it must
+        # Three things have been missing from a build at some point in
+        # this project's history: the console script, the schema the
+        # library needs to create its own table, and the licence. A
+        # green test suite says nothing about any of them.
+        run: |
+          uv run python - <<'PY'
+          import glob, sys, zipfile
+
+          names = zipfile.ZipFile(sorted(glob.glob("dist/*.whl"))[-1]).namelist()
+          required = {
+              "schema": "durable_agents/storage/schema.sql",
+              "licence": "licenses/LICENSE",
+              "entry points": "entry_points.txt",
+              "typed marker": "durable_agents/py.typed",
+          }
+          missing = [what for what, part in required.items() if not any(part in n for n in names)]
+          leftover = [n for n in names if n.endswith(("anthropic_client.py", "llm/replay.py"))]
+
+          for what in missing:
+              print(f"MISSING from wheel: {what}", file=sys.stderr)
+          for n in leftover:
+              print(f"empty stub module shipped: {n}", file=sys.stderr)
+          sys.exit(1 if missing or leftover else 0)
+          PY
+
+  quickstart:
+    name: quickstart runs from a clean install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install the built package only, not the dev environment
+        # Catches the class of bug where something imports a dev-only or
+        # demo-only module: this installs the wheel into a bare venv with
+        # no dev group, the way a stranger running `pip install
+        # durable-agents` would get it.
+        run: |
+          uv build --wheel
+          uv venv /tmp/clean
+          VIRTUAL_ENV=/tmp/clean uv pip install dist/*.whl
+
+      - name: The README's own example, offline
+        run: VIRTUAL_ENV=/tmp/clean uv run --no-project python examples/quickstart.py
+
+      - name: The console script exists and runs
+        run: VIRTUAL_ENV=/tmp/clean uv run --no-project durable-agents --help

@@ -77,6 +77,46 @@ def test_json_serialization_prevents_that_cross_field_contamination() -> None:
     assert not any(m.rule == "pii_credit_card" for m in matches)
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "call +1 415 555 2671 today",
+        "Customer phone: +1-415-555-0134, order delivered.",
+        "ring 415-555-2671 now",
+        "tel (415) 555-2671 x",
+        "+44 20 7946 0958 uk",
+        "mob 020 7946 0958.",
+    ],
+)
+def test_real_phone_formats_are_detected(text: str) -> None:
+    matches, _redacted = scan_pii(text)
+    assert any(m.rule == "pii_phone" for m in matches), text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "order 1234567890123 shipped",
+        "invoice INV-99887766554",
+        "tracking 1Z999AA10123456784",
+        "ref 8891 6400 3000 1200",
+        "sku 9780306406157 book",
+        "dates 2026-09-03 12-04-1999",
+        "ids 1111 2222 3333 4444 5555",
+    ],
+)
+def test_business_identifiers_are_not_mistaken_for_phone_numbers(text: str) -> None:
+    """The costly direction. A false positive here is silent: the number
+    is replaced with <PHONE_1> in what the model is sent, so the agent
+    simply cannot see the order it was asked about, and nothing reports
+    an error. An earlier pattern matched any 10-15 digit run and got
+    four of these five wrong.
+    """
+
+    matches, redacted = scan_pii(text)
+    assert not any(m.rule == "pii_phone" for m in matches), f"{text} -> {redacted}"
+
+
 def test_no_pii_leaves_text_unchanged() -> None:
     matches, redacted = scan_pii("Process refund for order A-8891.")
     assert matches == []

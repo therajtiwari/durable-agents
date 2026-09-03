@@ -65,15 +65,35 @@ def _credit_card_valid(raw: str) -> bool:
 
 
 def _phone_valid(raw: str) -> bool:
-    # The regex alone is deliberately loose (phone formatting varies too
-    # much across countries to pin down structurally); this validator is
-    # what actually keeps it from matching arbitrary short digit runs in
-    # ordinary business data (an order id next to an amount, e.g.
-    # "8891 6400", is 8 digits and not a phone number). 10-15 digits
-    # covers real-world international numbers without assuming a
-    # specific country's length.
+    # 10-15 digits covers real international numbers without assuming a
+    # country's length. This backs up the regex rather than carrying it:
+    # see PHONE_PATTERN below for why the shape has to do most of the
+    # work.
     digits = re.sub(r"\D", "", raw)
     return 10 <= len(digits) <= 15
+
+
+# Phone numbers have no checksum and no unambiguous shape, unlike the
+# other defaults (email, Luhn-checked card, IBAN). An earlier version
+# matched any run of 10-15 digits, which meant it quietly ate ordinary
+# business identifiers — order numbers, invoice numbers, tracking codes —
+# and replaced them with <PHONE_1> in what the model was sent. That
+# failure is silent and expensive: the agent asks about order
+# 1234567890123, the model sees a placeholder, and nothing anywhere
+# reports an error.
+#
+# So the shape must look like a dialable number rather than merely a
+# long number: an international "+" prefix, or digits genuinely grouped
+# by separators. The lookarounds keep it from starting or ending inside
+# a longer identifier (INV-99887766554, 1Z999AA10123456784) or from
+# matching a window inside a run of unrelated numbers ("8891 6400 3000
+# 1200"). Verified against both a set of real formats and a set of
+# business identifiers in tests/unit/test_guardrails_input_scan.py.
+PHONE_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])(?<!\d[\s\-])"
+    r"(?:\+\d[\d\s\-()]{7,16}\d|\(?\d{2,4}\)?[\s\-]\d{2,4}[\s\-]\d{2,6})"
+    r"(?![\s\-]?\d)(?![A-Za-z0-9])"
+)
 
 
 @dataclass(frozen=True)
@@ -96,7 +116,7 @@ DEFAULT_PII_PATTERNS: list[PIIPattern] = [
     PIIPattern("email", re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")),
     PIIPattern("credit_card", re.compile(r"\b(?:\d[ -]?){13,19}\b"), validate=_credit_card_valid),
     PIIPattern("iban", re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{10,30}\b")),
-    PIIPattern("phone", re.compile(r"\+?\d[\d\-\s()]{7,}\d"), validate=_phone_valid),
+    PIIPattern("phone", PHONE_PATTERN, validate=_phone_valid),
 ]
 
 
