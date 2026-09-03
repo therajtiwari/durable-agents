@@ -22,12 +22,25 @@ from durable_agents.llm.scripted import ScriptedLLM
 from durable_agents.orchestrator import Orchestrator
 from durable_agents.storage.postgres import PostgresEventStore
 from durable_agents.tools.refund_backend_postgres import PostgresRefundBackend
-from durable_agents.tools.refund_demo_scenario import canonical_run_started, canonical_script
+from durable_agents.tools.refund_demo_scenario import (
+    canonical_run_started,
+    canonical_script,
+    parallel_refund_script,
+    parallel_run_started,
+)
 from durable_agents.tools.refund_tools import build_refund_tools
 
 DSN = os.environ.get(
     "DATABASE_URL", "postgresql://durable_agents:durable_agents@localhost:5432/durable_agents"
 )
+
+# CHAOS_SCENARIO=parallel runs the three-refunds-in-one-turn script
+# instead of the canonical one-call-per-turn script, so the suite can
+# kill a process partway through a batch.
+SCENARIOS = {
+    "canonical": (canonical_run_started, canonical_script),
+    "parallel": (parallel_run_started, parallel_refund_script),
+}
 
 
 def _env_int(name: str) -> int | None:
@@ -36,11 +49,13 @@ def _env_int(name: str) -> int | None:
 
 
 async def main(run_id: UUID) -> None:
+    run_started, script = SCENARIOS[os.environ.get("CHAOS_SCENARIO", "canonical")]
+
     store = await PostgresEventStore.connect(DSN)
     events = await store.read(run_id)
 
     if not events:
-        await store.append(run_id, 0, canonical_run_started(requested_by="chaos-test"))
+        await store.append(run_id, 0, run_started(requested_by="chaos-test"))
         # RunStarted is appended before an Orchestrator (and its kill
         # hook) exists, so seq 0 needs its own check here — otherwise
         # CHAOS_KILL_AFTER_SEQ=0 would silently never fire.
@@ -50,7 +65,7 @@ async def main(run_id: UUID) -> None:
         events = await store.read(run_id)
 
     already_completed = sum(1 for e in events if isinstance(e, LLMCallCompleted))
-    llm = ScriptedLLM(canonical_script()[already_completed:])
+    llm = ScriptedLLM(script()[already_completed:])
 
     backend = await PostgresRefundBackend.connect(DSN)
     tools = {t.name: t for t in build_refund_tools(backend)}

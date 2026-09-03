@@ -28,15 +28,20 @@ from durable_agents.events import (
 class Message:
     """A single turn in the conversation sent to the LLM.
 
-    Deliberately minimal and provider-agnostic for now. No LLM client
-    exists yet (week 2), so this shape is provisional — it may need to
-    change once there's a real provider API to match.
+    Deliberately minimal and provider-agnostic: an LLMClient translates
+    this into whatever wire format its provider speaks.
     """
 
     role: Literal["user", "assistant", "tool"]
     content: str | None = None
     tool_calls: list[ToolCallInvocation] | None = None
     tool_name: str | None = None
+    tool_call_id: str | None = None
+    """On a tool-role message, which of the assistant's tool_calls this
+    answers. None on messages rebuilt from events written before the
+    field existed — those logs only ever had one call outstanding at a
+    time, so order alone identifies them (see decide_next_action).
+    """
 
 
 @dataclass(frozen=True)
@@ -54,6 +59,7 @@ class InFlightOp:
     tool: str | None = None
     arguments: dict[str, Any] | None = None
     idempotency_key: str | None = None
+    tool_call_id: str = ""
     attempts: int = 0
     """Failed attempts at this operation so far. Lives here rather than
     in the orchestrator so a resumed process picks up the retry budget
@@ -70,6 +76,7 @@ class PendingApproval:
     arguments: dict[str, Any]
     reason: str
     requested_at_seq: int
+    tool_call_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -104,6 +111,16 @@ class RunState:
     total_cost_usd: Decimal = Decimal("0")
     pending_approval: PendingApproval | None = None
     approved_step: int | None = None
+    """Legacy, step-level approval grant. Only consulted for logs written
+    before approvals identified a specific tool call; new grants set
+    approved_tool_call_id instead. Kept so a run parked under the old
+    shape still resumes correctly after being granted.
+    """
+    approved_tool_call_id: str | None = None
+    """The one tool call a human has cleared for execution. Per-call
+    rather than per-step because a single step may carry several tool
+    calls, and approving one of them must not release the rest.
+    """
     guardrail_hits: list[GuardrailHit] = field(default_factory=list)
     max_steps: int | None = None
     max_cost_usd: Decimal | None = None
@@ -173,10 +190,16 @@ def apply(state: RunState, event: Event) -> RunState:
                     tool=event.tool,
                     arguments=event.arguments,
                     idempotency_key=event.idempotency_key,
+                    tool_call_id=event.tool_call_id,
                 ),
-                # Consumes any pending approval grant for this step — it's
-                # done its one job of letting this exact request through.
+                # Consumes any pending approval grant — it's done its one
+                # job of letting this exact request through. Cleared on
+                # any request, not just the approved one, because a grant
+                # only ever exists once earlier calls in the batch have
+                # already been answered, so nothing unapproved can slip
+                # past it.
                 approved_step=None,
+                approved_tool_call_id=None,
             )
 
         case ToolCallCompleted():
@@ -184,6 +207,7 @@ def apply(state: RunState, event: Event) -> RunState:
                 role="tool",
                 content=json.dumps(event.result),
                 tool_name=event.tool,
+                tool_call_id=event.tool_call_id or None,
             )
             return replace(
                 state,
@@ -214,6 +238,7 @@ def apply(state: RunState, event: Event) -> RunState:
                 role="tool",
                 content=f"Error: {event.error}",
                 tool_name=event.tool,
+                tool_call_id=event.tool_call_id or None,
             )
             return replace(
                 state,
@@ -238,6 +263,7 @@ def apply(state: RunState, event: Event) -> RunState:
                     arguments=event.arguments,
                     reason=event.reason,
                     requested_at_seq=event.seq,
+                    tool_call_id=event.tool_call_id,
                 ),
             )
 
@@ -245,12 +271,18 @@ def apply(state: RunState, event: Event) -> RunState:
             # decide_next_action will produce the exact same ExecuteTool
             # decision it produced before the approval was requested (the
             # assistant message that carried this tool call never
-            # changed). approved_step marks that one instance as cleared
-            # so the orchestrator skips requires_approval() for it,
-            # rather than parking on ApprovalRequested a second time.
-            approved_step = state.pending_approval.step if state.pending_approval else None
+            # changed). These mark that one call as cleared so the
+            # orchestrator skips requires_approval() for it, rather than
+            # parking on ApprovalRequested a second time.
+            pending = state.pending_approval
             return replace(
-                state, status="running", pending_approval=None, approved_step=approved_step
+                state,
+                status="running",
+                pending_approval=None,
+                approved_step=pending.step if pending else None,
+                approved_tool_call_id=(
+                    pending.tool_call_id if pending and pending.tool_call_id else None
+                ),
             )
 
         case ApprovalDenied():
@@ -260,11 +292,15 @@ def apply(state: RunState, event: Event) -> RunState:
             # requires_approval() again — parking forever. Feeding the
             # denial back as a tool-role message makes the model react
             # instead.
-            tool_name = state.pending_approval.tool if state.pending_approval else None
+            pending = state.pending_approval
             message = Message(
                 role="tool",
                 content=f"Error: approval denied: {event.reason}",
-                tool_name=tool_name,
+                tool_name=pending.tool if pending else None,
+                # Marks the denied call as answered, so decide_next_action
+                # moves on to the rest of the batch instead of proposing
+                # it again and parking forever.
+                tool_call_id=(pending.tool_call_id or None) if pending else None,
             )
             return replace(
                 state,

@@ -72,6 +72,66 @@ def canonical_script() -> list[LLMResponse | Exception]:
     ]
 
 
+def parallel_refund_script() -> list[LLMResponse | Exception]:
+    """One model turn asking for three refunds at once.
+
+    The canonical script above only ever has one tool call per response,
+    so it exercises none of the batching path — which is exactly how a
+    real bug lived there undetected until Iteration 33. This scenario
+    exists so the chaos suite can kill a process partway through a batch:
+    each refund is a distinct side effect with its own idempotency key,
+    so resuming must produce three refunds, never two and never four.
+
+    Amounts stay under the ₹5,000 approval threshold deliberately, to
+    keep this about crash recovery rather than approval parking.
+    """
+
+    orders = [("A-8891", 1000), ("B-2277", 2000), ("C-3355", 3000)]
+    return [
+        LLMResponse(
+            content="Refunding all three damaged orders.",
+            tool_calls=[
+                ToolCallInvocation(
+                    id=f"p{i}",
+                    name="issue_refund",
+                    arguments={"order_id": order_id, "amount_inr": amount, "reason": "damaged"},
+                )
+                for i, (order_id, amount) in enumerate(orders, start=1)
+            ],
+            stop_reason="tool_use",
+            input_tokens=500,
+            output_tokens=90,
+            cost_usd=Decimal("0.003"),
+            latency_ms=5,
+            provider_request_id="p-r1",
+        ),
+        LLMResponse(
+            content="All three refunds processed.",
+            tool_calls=[],
+            stop_reason="end_turn",
+            input_tokens=600,
+            output_tokens=30,
+            cost_usd=Decimal("0.002"),
+            latency_ms=5,
+            provider_request_id="p-r2",
+        ),
+    ]
+
+
+def parallel_run_started(requested_by: str) -> RunStarted:
+    return RunStarted(
+        seq=0,
+        created_at=datetime.now(timezone.utc),
+        goal="Refund orders A-8891, B-2277 and C-3355 — all arrived damaged.",
+        model="scripted",
+        system_prompt="You are a customer support agent handling refunds.",
+        max_steps=15,
+        max_cost_usd=Decimal("2.00"),
+        requested_by=requested_by,
+        guardrail_profile="financial_v1",
+    )
+
+
 def canonical_run_started(requested_by: str) -> RunStarted:
     return RunStarted(
         seq=0,

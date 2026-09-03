@@ -860,6 +860,62 @@ clean (63 files), 120/120 non-live tests. Full detail:
   in context to attach an `ApprovalRequested` to. Needs either a schema
   change or a deliberate decision to keep failing closed.
 
+## Week 6, Day 3 — pre-publish audit, and the first blocker fixed
+
+A full critical audit was run against the spec + source + suite before
+publishing to PyPI. It produced 20 findings, 6 of them publish
+blockers, two confirmed by executing the package rather than reading it.
+The full report is an artifact; the findings are tracked below.
+
+**Blocker 1 fixed (Iteration 33): parallel tool calls.** The
+orchestrator executed `tool_calls[0]` and silently discarded the rest,
+then reported the run `completed` — and the conversation it replayed
+afterwards was one providers reject outright. Nobody decided this; it
+was inherited from spec §15's one-call-per-step worked example and no
+test had ever used a multi-call response. Fixed by persisting
+`tool_call_id` and having `decide_next_action` return the first
+unanswered call in the most recent assistant turn. Executed
+sequentially on purpose (one op in flight, so crash recovery is
+unchanged), and approval became per-call rather than per-step so
+approving one call in a batch can't release a destructive sibling.
+
+17 new tests — 11 unit (`tests/unit/test_parallel_tool_calls.py`) and 6
+chaos. The unit set covers every route that resolves one call in a batch
+by something other than a clean completion: denial, spent retry budget,
+retry reusing the same idempotency key, hallucinated tool name,
+duplicate ids, and step accounting. The chaos suite gained a second
+scenario (`CHAOS_SCENARIO=parallel`, three refunds in one model turn)
+and kills at all 11 meaningful seqs, asserting three distinct keys with
+exactly one ledger row each. All confirmed red against the old behaviour
+first. Worth recording why the extra tests happened: the first pass had
+five, and the denial-mid-batch path was code written on an assertion
+with no test behind it. Full detail: `docs/BUILD_LOG.md` iteration 33.
+
+**Remaining publish blockers, in the order agreed:**
+
+1. ~~Parallel tool calls silently dropped~~ — done, Iteration 33.
+2. **Raw PII persisted into the append-only log.** `scan_pii` puts the
+   matched text in `GuardMatch.detail`, which flows unfiltered onto
+   `GuardrailTriggered` and into JSONB. Confirmed: a card number and an
+   email written verbatim into a table the architecture forbids
+   deleting from. Spec §15 already specifies the correct payload
+   (entity + placeholder, never the value) and says why.
+3. **Guardrails can't be disabled** and `get_profile()` silently falls
+   back to `standard` on an unknown name, while the README calls them
+   optional.
+4. **No `LICENSE` file** despite `license = "MIT"` in metadata and the
+   README.
+5. **Two empty stub modules ship in the wheel** —
+   `llm/anthropic_client.py` and `llm/replay.py`, both 0 bytes, both
+   names the spec promises.
+6. **`durable-agents init-db` prints the DSN**, password included.
+
+Then the should-fix set (event `schema_version` while no logs exist in
+the wild; demo `policy_caps` hardcoded into shipped profiles; a REDACT
+verdict on injection that redacts nothing; no CI at all; `cli.py`
+importing demo modules at module scope; cap checks running before the
+in-flight check), and only then Docker/deploy and Phase 4.
+
 ## Week 6, Day 2 — approval queue: `GET /approvals`
 
 Real gap surfaced while manually testing the approval flow: the API

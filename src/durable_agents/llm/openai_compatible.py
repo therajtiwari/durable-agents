@@ -125,14 +125,16 @@ class OpenAICompatibleClient(LLMClient):
             result.append({"role": "system", "content": system_prompt})
 
         # OpenAI's wire format requires every tool-role message to carry
-        # tool_call_id, matching the id on the assistant tool_calls entry
-        # it responds to. That id lives on the preceding assistant
-        # message's own ToolCallInvocation (never persisted onto the
-        # ToolCallRequested/Completed events themselves), so it's
-        # recovered here by pairing each tool message with the assistant
-        # message directly before it — valid because the orchestrator
-        # only ever acts on one tool call per step today.
-        last_tool_call_id: str | None = None
+        # the tool_call_id of the assistant tool_calls entry it answers,
+        # and rejects the request outright if any of an assistant turn's
+        # calls goes unanswered. Messages rebuilt from the event log
+        # carry that id directly.
+        #
+        # The fallback covers logs written before the id was recorded:
+        # back then only one call was ever outstanding at a time, so the
+        # calls of the most recent assistant turn, consumed in order,
+        # reconstruct exactly what those events meant.
+        unclaimed_ids: list[str] = []
         for message in messages:
             if message.role == "user":
                 result.append({"role": "user", "content": message.content or ""})
@@ -150,13 +152,19 @@ class OpenAICompatibleClient(LLMClient):
                         }
                         for call in message.tool_calls
                     ]
-                    last_tool_call_id = message.tool_calls[0].id
+                    unclaimed_ids = [call.id for call in message.tool_calls]
                 result.append(entry)
             else:  # tool
+                if message.tool_call_id:
+                    tool_call_id = message.tool_call_id
+                    if tool_call_id in unclaimed_ids:
+                        unclaimed_ids.remove(tool_call_id)
+                else:
+                    tool_call_id = unclaimed_ids.pop(0) if unclaimed_ids else ""
                 result.append(
                     {
                         "role": "tool",
-                        "tool_call_id": last_tool_call_id or "",
+                        "tool_call_id": tool_call_id,
                         "content": message.content or "",
                     }
                 )

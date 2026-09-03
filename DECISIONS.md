@@ -256,16 +256,25 @@ the event log (Iteration 24). A client-level retry would double the
 backoff for no benefit and duplicate logic that already exists at the
 layer meant to own it.
 
-**The OpenAI-shaped `tool_call_id` is recovered by pairing, not
-persisted.** OpenAI's format requires a tool-result message to carry
-the id of the assistant `tool_calls` entry it answers — but
-`durable_agents` events never store that id past the turn that produced
-it. Rather than add a field to `ToolCallRequested`/`ToolCallCompleted`
-(more write-yourself-file churn for a client-side formatting detail),
-the client pairs each tool-role message with the immediately preceding
-assistant message's `tool_calls[0].id` when building the request. Valid
-today because the orchestrator only ever acts on one tool call per
-step; would need revisiting if that ever changes.
+**~~The OpenAI-shaped `tool_call_id` is recovered by pairing, not
+persisted.~~ Superseded — the id is now persisted.** The original
+decision had the client pair each tool-role message with the preceding
+assistant message's `tool_calls[0].id`, to avoid adding a field to
+`ToolCallRequested`/`ToolCallCompleted` for what looked like a
+client-side formatting detail. It carried the caveat "valid today
+because the orchestrator only ever acts on one tool call per step;
+would need revisiting if that ever changes."
+
+That caveat treated a **limitation** as a stable premise. Acting on one
+tool call per step was never a decision anyone made — it was inherited
+from spec §15's worked example, where every step happens to have
+exactly one call, and it silently discarded calls 2..n of any batch. So
+the pairing hack was not a neat avoidance of schema churn; it was the
+downstream symptom of a correctness bug. Both are fixed together in
+Iteration 33: `tool_call_id` is a real field on
+`ToolCallRequested`/`Completed`/`Failed`/`ApprovalRequested`, and the
+client reads it directly. The positional pairing survives only as a
+fallback for logs written before the field existed.
 
 ---
 
@@ -314,6 +323,35 @@ demonstrated but not actually shipped.
 an outage for every other run; `run_forever` separately catches
 failures of the polling query itself so the worker recovers when a
 database comes back rather than needing a restart.
+
+---
+
+## Parallel tool calls
+
+**A batch is executed one call at a time, not concurrently.** A model
+may ask for several tools in one response; each gets its own
+`ToolCallRequested`/`ToolCallCompleted` pair, issued in order, and the
+model is not called again until every call in the batch has a result.
+Rejected: `asyncio.gather` over the batch. Concurrency is an
+optimisation, and it would mean several operations in flight at once —
+turning crash recovery from "one dangling `Requested`" into a
+multi-operation reconciliation, which is a materially harder problem
+for a benefit no correctness property needs. Sequential execution keeps
+recovery exactly as it was.
+
+**Approval is granted per tool call, not per step.** `RunState` gained
+`approved_tool_call_id`; the old `approved_step` remains only as the
+fallback for runs parked before approvals recorded an id. Once a step
+can carry several calls, a step-level grant would mean approving the
+one call that needed a human silently released every other call in the
+same batch — including a destructive one the human never saw.
+
+**Every new field defaults to empty, so existing logs rebuild
+unchanged.** A tool-role message with no `tool_call_id` answers the
+first still-open call, which is exactly what a pre-change log meant by
+position, since only one call was ever outstanding then. There is a
+test that builds such a log by hand and proves the completed call is
+not re-executed.
 
 ---
 

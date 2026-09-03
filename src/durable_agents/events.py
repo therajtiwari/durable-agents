@@ -95,6 +95,17 @@ class ToolCallRequested(BaseEvent):
     idempotency_key: str
     requires_approval: bool
     approved_by_seq: int | None = None
+    tool_call_id: str = ""
+    """Which of the model's own tool_calls entries this answers.
+
+    A model may ask for several tools in one response; each gets its own
+    Requested/Completed pair, and this is what pairs them back up — both
+    for deciding what still needs running and for rebuilding the
+    provider's required tool_call_id on the next request. Defaults empty
+    so events written before parallel tool calls were supported still
+    load; a log from then only ever had one call outstanding at a time,
+    so position alone is enough to interpret it.
+    """
 
 
 class ToolCallCompleted(BaseEvent):
@@ -106,6 +117,7 @@ class ToolCallCompleted(BaseEvent):
     duration_ms: int
     recovered: bool
     provider_dedup_hit: bool
+    tool_call_id: str = ""
 
 
 class ToolCallFailed(BaseEvent):
@@ -116,6 +128,7 @@ class ToolCallFailed(BaseEvent):
     idempotency_key: str
     error: str
     attempt: int
+    tool_call_id: str = ""
     final_attempt: bool = True
     """False when the orchestrator intends to retry this exact call again
     (same idempotency_key), so the operation stays in flight. True when
@@ -142,6 +155,12 @@ class ApprovalRequested(BaseEvent):
     tool: str
     arguments: dict[str, Any]
     reason: str
+    tool_call_id: str = ""
+    """Which specific tool call a human is being asked about. Carried so
+    a grant releases exactly that call — when a model asks for several
+    tools at once and only one of them needs approving, approving it
+    must not silently clear the gate for the others.
+    """
 
 
 class ApprovalGranted(BaseEvent):

@@ -66,17 +66,68 @@ def decide_next_action(state: RunState) -> Decision:
     orchestrator so this stays as easy to unit test as rebuild_state. Only ever called
     when state.in_flight is None — the caller (Orchestrator.run) reconciles
     any in-flight operation before this is reached.
+
+    A model may ask for several tools in one response, and every one of
+    them must get a result before it is called again — both because the
+    caller genuinely wanted all of that work done, and because providers
+    reject a conversation where an assistant's tool_calls aren't each
+    answered. So this walks back to the most recent assistant turn and
+    returns the first call in it that nothing has answered yet, one per
+    iteration; only once the whole batch is answered does the model get
+    called again.
+
+    Executing them one at a time rather than concurrently is deliberate:
+    it keeps exactly one operation in flight, so crash recovery stays the
+    single-dangling-Requested case it has always been. Running a batch
+    concurrently is an optimisation, and it would make recovery
+    materially harder.
     """
 
     if state.status == "not_started":
         raise ValueError("cannot decide an action for a run with no RunStarted event yet")
 
-    last = state.messages[-1]
-    if last.role == "assistant":
-        if last.tool_calls:
-            return ExecuteTool(tool_call=last.tool_calls[0])
-        return Finish(final_answer=last.content or "")
+    assistant_index = _last_assistant_index(state.messages)
+    if assistant_index is None:
+        return CallLLM()
+
+    assistant = state.messages[assistant_index]
+    if not assistant.tool_calls:
+        return Finish(final_answer=assistant.content or "")
+
+    unanswered = _unanswered_calls(assistant.tool_calls, state.messages[assistant_index + 1 :])
+    if unanswered:
+        return ExecuteTool(tool_call=unanswered[0])
     return CallLLM()
+
+
+def _last_assistant_index(messages: list[Message]) -> int | None:
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].role == "assistant":
+            return i
+    return None
+
+
+def _unanswered_calls(
+    tool_calls: list[ToolCallInvocation], later_messages: list[Message]
+) -> list[ToolCallInvocation]:
+    """Which of this turn's tool calls still have no result.
+
+    Answers are matched by tool_call_id. A tool message carrying no id
+    comes from a log written before that field existed, where only one
+    call was ever outstanding at a time — such a message answers the
+    first still-open call, which is what that older log meant by
+    position.
+    """
+
+    pending = list(tool_calls)
+    for message in later_messages:
+        if message.role != "tool":
+            continue
+        if message.tool_call_id:
+            pending = [call for call in pending if call.id != message.tool_call_id]
+        elif pending:
+            pending.pop(0)
+    return pending
 
 
 def _tool_schemas(tools: dict[str, Tool]) -> list[dict[str, Any]]:
@@ -115,8 +166,9 @@ class Orchestrator:
     died — rebuild_state can't tell the difference, and neither does this
     loop. It just finishes whatever's in flight.
 
-    Known simplification, not yet built:
-    - No guardrails (Week 5) — nothing runs between decide and act yet.
+    Exactly one operation is in flight at a time, including when a model
+    asks for several tools at once — those are executed one after another,
+    each with its own Requested/Completed pair. See decide_next_action.
     """
 
     def __init__(
@@ -429,6 +481,7 @@ class Orchestrator:
                     idempotency_key="",
                     error=f"unknown tool: {tool_call.name}",
                     attempt=1,
+                    tool_call_id=tool_call.id,
                 ),
             )
             return
@@ -473,7 +526,16 @@ class Orchestrator:
             )
             forced_by_escalation = escalation_action == "ESCALATE"
 
-        already_approved = state.approved_step == state.step
+        # A grant releases one specific call. Matching on the id matters
+        # once a step can carry several calls: approving the one that
+        # needed a human must not wave the others through. The step-level
+        # comparison is the fallback for runs parked before approvals
+        # recorded an id at all.
+        if state.approved_tool_call_id is not None:
+            already_approved = state.approved_tool_call_id == tool_call.id
+        else:
+            already_approved = state.approved_step is not None and state.approved_step == state.step
+
         if not already_approved and (tool_obj.requires_approval(tool_call.arguments) or forced_by_escalation):
             await self._append(
                 run_id,
@@ -485,6 +547,7 @@ class Orchestrator:
                     tool=tool_call.name,
                     arguments=tool_call.arguments,
                     reason=f"{tool_call.name} requires approval for these arguments",
+                    tool_call_id=tool_call.id,
                 ),
             )
             return
@@ -502,6 +565,7 @@ class Orchestrator:
                 arguments=tool_call.arguments,
                 idempotency_key=key,
                 requires_approval=False,
+                tool_call_id=tool_call.id,
             ),
         )
 
@@ -617,6 +681,7 @@ class Orchestrator:
                         error=str(exc),
                         attempt=attempt,
                         final_attempt=final_attempt,
+                        tool_call_id=op.tool_call_id,
                     ),
                 )
                 return
@@ -684,5 +749,6 @@ class Orchestrator:
                     duration_ms=duration_ms,
                     recovered=recovered,
                     provider_dedup_hit=provider_dedup_hit,
+                    tool_call_id=op.tool_call_id,
                 ),
             )

@@ -2792,3 +2792,171 @@ clean (59 files), 146/146 non-live tests passing (10 new — the
 "requires status"/"rejects unsupported status" tests no longer apply
 once the query param is gone, replaced by one empty-queue test), 2
 deselected as designed.
+
+## Iteration 33 — parallel tool calls: the bug the spec's own example hid
+
+Found by the pre-publish audit, and the most serious thing in it.
+
+### What was wrong
+
+`decide_next_action` returned `ExecuteTool(tool_call=last.tool_calls[0])`.
+When a model asked for several tools in one response — the default
+behaviour of every current frontier model — calls 2..n were never
+executed, never recorded, and never mentioned. The run then reached
+`RunCompleted`. A caller asking an offboarding agent to revoke three
+systems got one revoked and a confident report of success.
+
+Measured before the fix, three calls requested:
+
+```
+requested        : 3  (Paris, Tokyo, Lima)
+actually executed: 1  ['Paris']
+run status       : completed
+```
+
+The second half was worse in practice. Providers reject an assistant
+turn whose `tool_calls` are not each answered, so the conversation
+replayed on the next step — 3 `tool_calls`, 1 `tool` reply — draws a
+400. Every exception is retryable here, so the run burned its budget
+and died as `unrecoverable_error`, with an error about message
+formatting rather than about the missing work.
+
+### Why it survived six weeks
+
+Nobody decided it. `docs/SPEC.md` §15's worked example has exactly one
+tool call per step, every step, and the code implemented that
+faithfully — a 2023-era ReAct loop, one thought one action, written
+before parallel tool calling existed. `DECISIONS.md` recorded the
+*consequence* ("valid today because the orchestrator only ever acts on
+one tool call per step") while treating the premise as stable ground.
+That entry is now marked superseded, with the reasoning, rather than
+quietly edited.
+
+No test anywhere used a multi-call response, which is why 146 green
+tests said nothing about it.
+
+### The change
+
+`tool_call_id` becomes a real, persisted field on `ToolCallRequested`,
+`ToolCallCompleted`, `ToolCallFailed`, and `ApprovalRequested`, and is
+carried onto `Message`, `InFlightOp`, and `PendingApproval`. It is both
+the key for "which of the model's requests does this answer" and the
+fix for the OpenAI client's positional-pairing hack, which was a
+symptom of the same bug.
+
+`decide_next_action` now walks back to the most recent assistant turn
+and returns the first call in it that nothing has answered, one per
+iteration; the model is called again only when the batch is complete.
+
+Three decisions worth stating (all in `DECISIONS.md`):
+
+- **Sequential, not concurrent.** One operation stays in flight, so
+  crash recovery remains the single-dangling-`Requested` case it has
+  always been. `asyncio.gather` would turn recovery into
+  multi-operation reconciliation for a benefit correctness doesn't need.
+- **Approval is per call now**, via `RunState.approved_tool_call_id`.
+  Under the old step-level grant, approving the one call that needed a
+  human would have released every other call in the same batch. The
+  test for this is the sharpest one in the suite: two `wipe_disk` calls,
+  approve the first, and the second must park for its own decision.
+- **All new fields default to empty**, and an id-less tool message
+  answers the first still-open call — exactly what a pre-change log
+  meant by position.
+
+### Tests
+
+`tests/unit/test_parallel_tool_calls.py`, 5 tests: the whole batch
+executes with one Requested/Completed pair and a distinct idempotency
+key each; the wire format answers every id; a resume mid-batch runs only
+the remaining call and re-runs neither finished one; approving one call
+does not release another; and a hand-built legacy log with no ids
+anywhere neither re-executes nor breaks the wire format.
+
+Four of the five were confirmed red against the old behaviour before
+being kept. The fifth — the legacy-log test — passes both ways by
+design, since it guards backward compatibility rather than the new
+behaviour. The approval failure was the instructive one: under the old
+code that test reported `completed` having wiped `alpha` only, with
+`beta` never proposed, never approved, and never mentioned.
+
+Also fixed here: `Orchestrator`'s class docstring still claimed "No
+guardrails (Week 5) — nothing runs between decide and act yet," which
+has been false since Iteration 21, and `Message`'s claimed no LLM
+client existed yet.
+
+### Then the tests that were actually missing
+
+The first five tests covered the happy path and the two obvious risks.
+Asked whether that was really enough, the honest answer was no — and the
+gap that mattered most was embarrassing: `state.py`'s `ApprovalDenied`
+branch had been given a `tool_call_id` specifically so a denied call
+counts as answered and the batch continues, with a comment saying so,
+and nothing tested it. Code written on an assertion, shipped on faith.
+
+Every route that resolves one call in a batch by something other than a
+clean `ToolCallCompleted` is a separate code path, and each has to mark
+that call answered or `decide_next_action` proposes it forever. Six more
+tests, one per route:
+
+- a denied call lets its siblings run (the untested one — it did work)
+- a call whose retry budget is spent is answered by the surfaced error
+- a retry inside a batch presents the *same* idempotency key both times,
+  so batching can't reintroduce a double charge
+- a hallucinated tool name, which fails before any `ToolCallRequested`
+  is written and so takes a different path again
+- duplicate `tool_call_id`s from a misbehaving provider still terminate
+- a batch is one step, not several, so a wide turn doesn't burn a step
+  cap sized for reasoning turns
+
+### And the chaos coverage it didn't have
+
+The chaos suite only ever ran the canonical one-call-per-turn script, so
+this project's strongest technique — real `SIGKILL`, real Postgres, real
+separate processes — touched none of the new path. Added a second
+scenario (`CHAOS_SCENARIO=parallel`): one model turn requesting three
+refunds, amounts kept under the approval threshold so the test is about
+crashing rather than parking.
+
+`test_resume_mid_batch_from_any_kill_point` kills at all 11 meaningful
+seqs and asserts three distinct idempotency keys with exactly one ledger
+row each — not two (a dropped call, the bug itself) and not four (a
+duplicate, the guarantee the key exists to give). Keys are read back out
+of the log rather than recomputed from hardcoded seqs, since which seq a
+refund lands on is part of what a crash is allowed to vary.
+
+All 11 confirmed red against the old behaviour before being kept: it
+only ever requested one of the three, so `len(keys) == 3` failed by
+construction.
+
+### Batches of genuinely different tools
+
+Asked whether three *different* tools in one turn had been covered, the
+answer was no: every test above used one or two distinct tools, and the
+chaos scenario used three calls to the same one. The realistic case is a
+fan-out across unrelated systems, which exercises things a uniform batch
+cannot — each call validating against its own args schema, and
+`idempotency_key` being injected only into the tools that declare it.
+
+Two more tests: `revoke_okta` + `revoke_github` + `lookup_manager` in one
+turn (three schemas, three distinct keys, only one tool taking a key),
+and a mixed batch where only the middle call needs a human — the run
+parks with the read-only call already done, the grant releases exactly
+that one call, and the completed call is not re-run on resume. Both
+passed first time; the behaviour was already correct, but nothing had
+demonstrated it.
+
+### Honest count of what was confirmed red
+
+Of the 13 unit tests, **10 fail against the old behaviour**, not all 13.
+Three pass either way and are recorded as regression guards rather than
+proof of the fix: the legacy-log test (which exists precisely to pass
+both ways), and the retry-key and duplicate-id tests, where the first
+call in the batch happens to produce the same observable outcome under
+the old code. An earlier draft of this entry claimed all of them were
+red; that was wrong and is corrected here rather than quietly amended.
+
+**Full regression:** `mypy --strict` clean (60 files), 170/170 non-live
+tests (19 new: 13 unit, 6 chaos; 21 of them failing without the fix),
+`examples/quickstart.py` verified end to end. `orchestrator.py` diffed
+byte-identical against a backup after each temporary revert, so nothing
+from the red runs leaked into the committed state.
