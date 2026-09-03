@@ -106,21 +106,31 @@ PII patterns are pluggable.
 
 ## Guardrail profiles (strictness levels)
 
-`RunState.guardrail_profile` (carried from `RunStarted`, added in
-Iteration 16) selects which threshold set `decisions.py` applies. Same
-detection code runs under every profile — only the thresholds that
-turn a detection into an action change. Proposed starting profiles,
-final numbers are `decisions.py`'s call:
+`RunState.guardrail_profile` (carried from `RunStarted`) selects which
+threshold set `decisions.py` applies, and which layers run at all.
 
-| Profile | Any injection match | PII match | L3 policy cap | Escalate after |
-|---|---|---|---|---|
-| `strict` **(proposal)** | → `ESCALATE` | → `REDACT` | ₹25,000 | 1 hit |
-| `standard` **(proposal)** | high-confidence → `BLOCK`, else `REDACT` | → `REDACT` | ₹1,00,000 | 3 hits |
-| `lenient` **(proposal)** | very-high-confidence only → `REDACT` | → `REDACT` | ₹5,00,000 | 5 hits |
+| Profile | Deterministic checks | PII | Injection patterns |
+|---|---|---|---|
+| `off` | off | off | off |
+| `validation` **(default)** | on | on | off |
+| `lenient` | on | on | very-high-confidence only → `REDACT`, escalate after 5 hits |
+| `standard` | on | on | ≥0.85 → `BLOCK`, else `REDACT`, escalate after 3 hits |
+| `strict` | on | on | any match → `ESCALATE`, escalate after 1 hit |
 
-`financial_v1`, used in every existing test fixture, should map to
-something at least as strict as `standard` — refunds are exactly the
-domain spec's own worked example is about.
+The deterministic checks (L3 schema and allowlist, policy caps, L4 loop
+detection) have no false positives by construction, so they are on
+everywhere except `off`. The injection patterns are the layer with a
+measured false-positive cost, so they are opted into by name — see the
+numbers below for why that is the default.
+
+A schema violation is returned to the model as a tool result rather than
+ending the run: a model getting an argument wrong is the most ordinary
+mistake in tool calling, and every other framework lets it self-correct.
+An unregistered tool, a policy cap actually exceeded, or a real loop
+still ends the run.
+
+`financial_v1` is a legacy alias appearing in older event logs and maps
+to `standard`.
 
 ## What this explicitly does not cover (this week)
 
@@ -157,15 +167,30 @@ or on any particular tool's own `requires_approval` setting.
 
 | Profile | Attack success rate | False positive rate |
 |---|---|---|
-| `strict` | 0% (60/60 caught) | 25% |
-| `standard` (= `financial_v1`) | 0% (60/60 caught) | 20% |
+| `off` | 100% (0/60 caught) | 0% |
+| `validation` **(default)** | 50% (30/60 caught) | 0% |
 | `lenient` | 25% (45/60 caught) | 5% |
+| `standard` (= `financial_v1`) | 0% (60/60 caught) | 20% |
+| `strict` | 0% (60/60 caught) | 25% |
 
 **The trade-off is real, not a wash** — that's the actual point of
 having profiles at all. `lenient` lets a quarter of this corpus's
 attacks through in exchange for a much lower false-positive rate;
 `standard` catches everything here at the cost of one in five benign
 requests getting flagged.
+
+**Why `validation` is the default.** It catches exactly the half of the
+corpus that deterministic checks cover — unregistered tools, malformed
+arguments, amounts over a configured cap — and none of the half that
+needs pattern matching, at zero false-positive cost. The alternative
+was defaulting to `standard`, where a 20% false-positive rate means one
+run in five dies. Since L2 scans every tool result, ordinary machine
+output triggers it: a tool returning `{"error": "system: disk full"}`
+matches `injection_system_override` at 0.9 confidence and the run ends
+as `RunFailed(guardrail_block)`. In a runtime whose purpose is that
+runs survive, that default undermined the part that works. The pattern
+layer is real and still available; it is opted into by someone who has
+read this table.
 
 **Honest finding, not smoothed over:** one iteration of pattern tuning
 happened here — the first pass caught only 52/60 (a 13% success rate)
