@@ -201,11 +201,6 @@ Neither client retries. Retries and their budget belong to the orchestrator.
 - Postgres or in-memory only. No SQLite, MySQL or Redis.
 - Recovery is poll-based. Nothing in the log records that a live process holds a
   run, so `Worker` infers it from silence. No leases, no distributed scheduler.
-- Rebuilding state is O(events). No snapshotting, so a long run gets slower to
-  resume.
-- Tool calls within one model turn run sequentially, not concurrently.
-- Your agent is built around `Runtime` rather than wrapping a loop you already
-  have.
 
 Event fields are only ever added, always with a default, and the meaning of an
 existing field does not change. If that ever has to happen, `schema_version` is

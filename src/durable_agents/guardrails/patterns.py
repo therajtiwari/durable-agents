@@ -144,8 +144,8 @@ def scan_pii(
     deleted — so a card number written into it could not be removed
     afterwards even in principle, and the event whose entire purpose is
     recording that a secret was redacted would be the thing storing it.
-    SPEC.md section 15 specifies this payload shape and calls getting it
-    wrong "the difference between an audit log and a data breach".
+    Recording the kind and position rather than the value is what keeps
+    this an audit log instead of a data breach.
 
     The span is offsets into the text that was scanned, which is enough
     to line a hit up against the redacted content an auditor can see,

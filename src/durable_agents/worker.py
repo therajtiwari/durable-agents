@@ -18,12 +18,11 @@ class Worker:
     idempotency keys already in the log making sure no side effect
     happens twice.
 
-    Spec describes a "worker" and a "recovery sweeper" as two separate
-    processes. They are the same mechanism — find a run_id, call
-    resume() — differing only in how long a run must be quiet before
-    it's considered abandoned, so this is one class with that duration
-    as a parameter. Run one instance and it does both jobs; run two with
-    different thresholds if you want spec's split literally.
+    A worker and a recovery sweeper are the same mechanism — find a
+    run_id, call resume() — differing only in how long a run must be
+    quiet before it's considered abandoned, so this is one class with
+    that duration as a parameter. Run one instance and it does both
+    jobs, or run two with different thresholds to separate them.
 
     Nothing here is specific to any agent: a Worker takes a Runtime,
     which already carries the tools and LLM client the consumer

@@ -112,13 +112,11 @@ def _profile(
         pii_detection=pii_detection,
         injection_patterns=injection_patterns,
         delimit_tool_results=delimit_tool_results,
-        # KNOWN WART, tracked separately: the shipped defaults below
-        # carry this project's own demo caps (issue_refund/amount_inr),
-        # which mean nothing to any other consumer. They stay for now
-        # because there is currently no way to supply your own — giving
-        # policy caps a real configuration path is its own change, and
-        # emptying them here would silently delete a documented check
-        # rather than fix the bias.
+        # Known limitation: the shipped profiles below carry example caps
+        # (issue_refund/amount_inr) that mean nothing to another
+        # consumer. They stay until policy caps have a real configuration
+        # path — emptying them here would silently remove a documented
+        # check rather than make it configurable.
         policy_caps=policy_caps if policy_caps is not None else {},
         loop_threshold=loop_threshold,
         escalation_threshold=escalation_threshold,

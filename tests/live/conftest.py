@@ -17,9 +17,8 @@ from durable_agents.llm.openai_compatible import OpenAICompatibleClient
 
 LIVE_API_KEY = os.environ.get("LLM_API_KEY")
 LIVE_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.groq.com/openai/v1")
-# Verified working against Groq's free tier as of this writing (see
-# docs/BUILD_LOG.md) — provider model names churn, override with
-# LLM_MODEL if this one has since been retired.
+# Verified against Groq's free tier. Provider model names churn —
+# override with LLM_MODEL if this one has since been retired.
 LIVE_MODEL = os.environ.get("LLM_MODEL", "openai/gpt-oss-120b")
 
 

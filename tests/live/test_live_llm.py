@@ -1,15 +1,14 @@
-"""Layer 8 — live tests, per docs/SPEC.md's testing strategy: a real
-provider, fake side effects always, skipped cleanly without a key so a
-fresh clone still runs green on the ordinary (non-live) test suite.
+"""Live tests: a real provider, fake side effects always, skipped
+cleanly without a key so a fresh clone still runs green on the ordinary
+(non-live) test suite.
 
     pytest -m live tests/live          # explicit opt-in only
     $env:LLM_API_KEY = "gsk_..."       # a Groq key works for free
 
 Kept to two tests on purpose. This tier exists to catch "does the wire
-format actually work against a real server" — exactly the class of bug
-the URL-merging fix in Iteration 26 was (a mocked transport can't catch
-a malformed request path; only a real server returns a real 404 for
-it). It is not a place to re-prove orchestrator logic already covered
+format actually work against a real server" — a mocked transport can't
+catch a malformed request path; only a real server returns a real 404
+for it. It is not a place to re-prove orchestrator logic already covered
 for free by the scripted suite.
 
 Assert on invariants, not exact wording: a real model may phrase its

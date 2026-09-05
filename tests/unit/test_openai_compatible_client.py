@@ -201,7 +201,7 @@ async def test_request_url_is_not_mangled_by_base_url_merging() -> None:
 
 @pytest.mark.asyncio
 async def test_http_error_status_raises_instead_of_swallowing() -> None:
-    """Orchestrator's own retry/backoff (Iteration 24) is what should
+    """Orchestrator's own retry/backoff is what should
     react to a failure — this client must not swallow one itself, or
     the retry budget in the event log would never see it.
     """

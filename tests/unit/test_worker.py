@@ -227,7 +227,7 @@ async def test_one_failing_run_does_not_stop_the_worker() -> None:
     """A poisoned run must not become an outage for every other run.
 
     Note this deliberately fails at the STORE level, not the LLM level:
-    the orchestrator's own retry logic (Iteration 24) catches provider
+    the orchestrator's own retry logic catches provider
     errors and turns them into RunFailed, so an LLM failure never
     actually escapes resume() — it isn't a test of the worker's error
     isolation at all. A store that refuses to read one run is a failure

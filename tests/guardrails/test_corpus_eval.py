@@ -1,14 +1,11 @@
-"""The actual measurement docs/THREAT_MODEL.md's evaluation plan
-promises: attack success rate and false positive rate over a labelled
-corpus, against this project's own "standard" profile (what
-guardrail_profile="financial_v1" resolves to).
+"""Attack success rate and false positive rate over a labelled corpus,
+the numbers reported in docs/THREAT_MODEL.md.
 
-Deliberately measures the detection+decision layer directly rather than
-running a full Orchestrator per case — see the design discussion this
-was built from: it isolates exactly what this week built (the
-detectors and the profile thresholds) without also depending on a
-scripted LLM "complying" with each of ~80 attacks, or on any particular
-tool's own requires_approval setting.
+Measures the detection and decision layers directly rather than running
+a full Orchestrator per case: that isolates the detectors and the
+profile thresholds, without also depending on a scripted LLM "complying"
+with each of ~80 attacks, or on any particular tool's requires_approval
+setting.
 """
 
 from dataclasses import dataclass
@@ -119,12 +116,9 @@ async def _run_corpus(profile_name: str) -> CorpusReport:
 
 @pytest.mark.asyncio
 async def test_guardrail_corpus_eval_standard_profile() -> None:
-    """The headline number. Prints a full report (run with -s to see
-    it) and asserts only a loose sanity bound — this is a first-pass,
-    untuned corpus against first-pass, untuned thresholds (see
-    docs/THREAT_MODEL.md's profile table, marked (proposal) throughout).
-    A tight assertion here would just be gamed against this specific
-    corpus rather than meaning anything.
+    """The headline number. Prints a full report (run with -s to see it)
+    and asserts only a loose sanity bound: a tight assertion would just
+    be gamed against this specific corpus rather than meaning anything.
     """
 
     report = await _run_corpus("standard")
@@ -144,9 +138,9 @@ async def test_guardrail_corpus_eval_standard_profile() -> None:
 
 @pytest.mark.asyncio
 async def test_guardrail_corpus_eval_across_all_profiles() -> None:
-    """Same corpus, all three profiles — shows the strictness knob
-    actually trades attack detection against false positives rather
-    than being a no-op, which is the entire point of having profiles.
+    """Same corpus, every profile — shows the strictness knob actually
+    trades attack detection against false positives rather than being a
+    no-op, which is the entire point of having profiles.
     """
 
     print("\n=== Guardrail corpus eval — profile comparison ===")

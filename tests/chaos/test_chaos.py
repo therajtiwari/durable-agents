@@ -134,9 +134,9 @@ def test_resume_mid_batch_from_any_kill_point(kill_after_seq: int) -> None:
 
     Three separate side effects are now in play per model turn rather
     than one, so a crash can land between them. Resuming must produce
-    exactly three refunds: not two (a dropped call, which is the bug
-    Iteration 33 fixed) and not four (a duplicated one, which is the
-    guarantee the idempotency key exists to give).
+    exactly three refunds: not two (a dropped call) and not four (a
+    duplicated one, which is the guarantee the idempotency key exists to
+    give).
     """
 
     run_id = uuid4()
@@ -158,8 +158,8 @@ def test_resume_mid_batch_from_any_kill_point(kill_after_seq: int) -> None:
 
 
 def test_kill_after_side_effect_before_completion_stays_exactly_once() -> None:
-    """The specific gap spec calls the nastiest bug: the tool's side
-    effect already ran, but nothing recorded that fact yet. A resumed
+    """The nastiest gap of all: the tool's side effect already ran, but
+    nothing recorded that fact yet. A resumed
     reconcile() calls issue_refund again — only the idempotency key,
     checked by the backend itself, stops that from becoming a second
     real refund.

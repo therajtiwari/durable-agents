@@ -29,10 +29,10 @@ async def validate_output(
     tool_obj = tools.get(tool_call.name)
     if tool_obj is None:
         # Allowlist violation — the model asked for a tool this run never
-        # registered. Distinct from Week 2's hallucinated-tool recovery
-        # (that's a non-adversarial ToolCallFailed the model can react
-        # to); this is the guardrail's independent record of the same
-        # fact, for the adversarial case where it wasn't an accident.
+        # registered. Distinct from the orchestrator's own
+        # hallucinated-tool handling (a non-adversarial ToolCallFailed the
+        # model can react to); this is the guardrail's independent record
+        # of the same fact, for the case where it wasn't an accident.
         matches.append(
             GuardMatch(rule="allowlist_violation", confidence=1.0, detail={"tool": tool_call.name})
         )

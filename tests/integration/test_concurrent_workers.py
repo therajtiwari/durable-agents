@@ -46,7 +46,7 @@ def _final_answer_response() -> LLMResponse:
 async def test_two_workers_racing_on_one_run_converge_without_crashing(
     postgres_container: PostgresContainer,
 ) -> None:
-    """Two workers, one run — spec's own Week 4 concurrency test.
+    """Two workers racing on one run.
 
     Deliberately two separate connection pools, not one shared pool: the
     race has to be genuine contention on the same Postgres rows, not

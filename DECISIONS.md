@@ -1,9 +1,8 @@
 # Decisions
 
 The forks that had a real alternative, and why this side was taken.
-`docs/BUILD_LOG.md` is the chronological narrative; this is the index of
-the choices worth defending. Where a decision has a known cost, the cost
-is stated rather than omitted.
+Where a decision has a known cost, the cost is stated rather than
+omitted.
 
 ---
 
@@ -23,11 +22,11 @@ Every call site in `run()`'s loop already falls through to the top,
 which re-reads events and rebuilds state — so the recovery was already
 written; it just needed the exception to stop killing the process.
 
-**Rejected a second index on `(run_id, seq)`** that the spec suggested:
+**Rejected a second index on `(run_id, seq)`:**
 the primary key already creates one. A duplicate would cost write
 throughput for no query benefit.
 
-**`EventStore` is an ABC, not a `Protocol`** (the spec's shape).
+**`EventStore` is an ABC, not a `Protocol`.**
 Nominal typing was wanted here: this is a public extension point where
 "did you mean to implement this?" should be an explicit, checkable yes.
 `RefundBackend`, a private internal seam, *is* a `Protocol` — the
@@ -100,7 +99,7 @@ own unit tests couldn't have caught.
 
 **Idempotency key = `sha256(run_id + seq + tool + canonical_json(args))`.**
 Deterministic: the same logical step yields the same key no matter how
-many times the process restarts. The spec's `idempotency="args"`
+many times the process restarts. An `idempotency="args"`
 decorator parameter was **dropped** — its own formula never used the
 value.
 
@@ -118,7 +117,7 @@ L3 validation. The model was being constructed and thrown away.
 ## Guardrails
 
 **Detection functions are plain functions taking their patterns as
-data.** Rejected: the spec's `class InputGuard: async def check(...)`.
+data.** Rejected: a `class InputGuard: async def check(...)` shape.
 `EventStore` and `LLMClient` are ABCs because there are genuinely
 swappable *implementations*; here there is one algorithm and swappable
 *data*.
@@ -126,8 +125,7 @@ swappable *implementations*; here there is one algorithm and swappable
 **PII patterns are pluggable, and the core defaults are
 locale-neutral** (email, Luhn-checked card, IBAN, international phone).
 Rejected: shipping India-specific patterns (PAN, Aadhaar, IFSC) as core
-defaults, which an earlier draft did by copying the spec's worked
-example. A library published to the world can't assume one country's ID
+defaults. A library published to the world can't assume one country's ID
 formats. Country-specific patterns are the consumer's configuration.
 
 **Policy caps are configuration, not constants,** for the same reason —
@@ -183,7 +181,7 @@ ambiguous phrasing; weakening the pattern to pass it would let a real
 ## API surface
 
 **`Runtime` supplies tools once, at construction — not per-run.**
-The spec's example passes `tools=[...]` to `start()`. Rejected because
+Passing `tools=[...]` to `start()` was rejected because
 nothing in the event log records which tools were registered, so a
 resumed run could silently execute against a different tool set than the
 one that produced the events being replayed.
@@ -271,8 +269,7 @@ script against `Runtime`/`Orchestrator` instead (already how every
 
 ## Provider client
 
-**`OpenAICompatibleClient`, not `AnthropicClient`.** Spec section 10
-names `AnthropicClient` as the reference implementation. Rejected:
+**`OpenAICompatibleClient`, not `AnthropicClient`.** Rejected:
 shipping one vendor-specific SDK wrapper as the library's only real
 client is the same shape of bias already caught and fixed in
 guardrails — a "universal" library defaulting to one company's format.
@@ -301,7 +298,7 @@ shape. Defaults to `$0` if you don't configure rates.
 
 **The client does not retry internally.** `Orchestrator` already
 retries a failed LLM call with backoff, reading the attempt budget from
-the event log (Iteration 24). A client-level retry would double the
+the event log. A client-level retry would double the
 backoff for no benefit and duplicate logic that already exists at the
 layer meant to own it.
 
@@ -316,11 +313,11 @@ would need revisiting if that ever changes."
 
 That caveat treated a **limitation** as a stable premise. Acting on one
 tool call per step was never a decision anyone made — it was inherited
-from spec §15's worked example, where every step happens to have
+from a worked example where every step happened to have
 exactly one call, and it silently discarded calls 2..n of any batch. So
 the pairing hack was not a neat avoidance of schema churn; it was the
 downstream symptom of a correctness bug. Both are fixed together in
-Iteration 33: `tool_call_id` is a real field on
+`tool_call_id` is now a real field on
 `ToolCallRequested`/`Completed`/`Failed`/`ApprovalRequested`, and the
 client reads it directly. The positional pairing survives only as a
 fallback for logs written before the field existed.
@@ -357,7 +354,7 @@ describes them as two processes. They are the same mechanism — find a
 run_id, call `resume()` — differing only in how long a run must be
 quiet before it's considered abandoned, so that duration is a
 parameter. Run one instance for both jobs, or two with different
-thresholds for spec's split. A deliberate divergence, documented rather
+thresholds to separate them. A deliberate divergence, documented rather
 than silently followed.
 
 **The Worker ships in the library, not in `examples/`.** It takes a

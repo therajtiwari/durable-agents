@@ -861,10 +861,9 @@ class Orchestrator:
                 # The side effect already ran — BLOCK here stops the run
                 # from acting on what might be poisoned data, it can't
                 # undo the tool call itself. This leaves in_flight
-                # dangling with no ToolCallCompleted, the same known gap
-                # flagged in Iteration 12 (status is checked before
-                # in_flight at the top of run()'s loop, so a terminal
-                # status always wins regardless).
+                # dangling with no ToolCallCompleted, a known gap: status
+                # is checked before in_flight at the top of run()'s loop,
+                # so a terminal status always wins regardless.
                 await self._append(
                     run_id,
                     seq,

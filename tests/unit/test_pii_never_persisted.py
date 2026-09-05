@@ -7,10 +7,8 @@ is no remediation for a subject-erasure request beyond dropping the
 table. And the leak would have been in GuardrailTriggered, the event
 whose whole purpose is recording that a secret was redacted.
 
-SPEC.md section 15 specifies the payload — entity and placeholder, never
-the value — and calls getting it wrong "the difference between an audit
-log and a data breach". It was wrong from Week 5 until this was caught
-by a pre-publish audit.
+The payload records the entity kind and its placeholder, never the value
+itself.
 """
 
 import json

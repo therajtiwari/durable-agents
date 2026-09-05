@@ -14,10 +14,9 @@ async def scan_input(
 ) -> ScanResult:
     """L1 — runs once on the user's goal, before the first LLM call.
 
-    async to match LLMClient's own calling convention and leave room for
-    a real classifier check later (Week 6, needs AnthropicClient) without
-    a breaking signature change — nothing here actually awaits anything
-    yet.
+    async to match LLMClient's own calling convention and to leave room
+    for a model-based classifier check without a breaking signature
+    change — nothing here actually awaits anything yet.
     """
 
     injection_matches = scan_patterns(goal)

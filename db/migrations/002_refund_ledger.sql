@@ -1,9 +1,11 @@
--- Backs PostgresRefundBackend, used specifically where the fake payments
--- API needs to survive a real process restart (the chaos test suite) —
--- an in-memory Python object cannot. Two tables, mirroring the same
--- separation as spec's own FakeRefundAPI: every physical call attempt
--- (refund_attempts, insert-only, never deduplicated) versus what actually
--- got created (refund_ledger, one row per idempotency_key, ever).
+-- Backs PostgresRefundBackend, for the case where the fake payments API
+-- has to survive a real process restart (the chaos suite) and an
+-- in-memory Python object cannot.
+--
+-- Two tables on purpose, so exactly-once is measurable rather than
+-- assumed: refund_attempts records every physical call, insert-only and
+-- never deduplicated, while refund_ledger holds one row per
+-- idempotency_key, ever. The gap between the two counts is the proof.
 
 CREATE TABLE refund_attempts (
     id              SERIAL      PRIMARY KEY,

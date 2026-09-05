@@ -1,9 +1,5 @@
-"""The one fixed, canonical refund scenario used across this project —
-by the real CLI's demo (start/resume) and the chaos test suite's
-scenario runner alike. Kept in one place so both stay in sync; this is
-demo content, not part of the generic runtime (same category as
-tools/refund_tools.py — see the Week 6 packaging note about moving both
-out of the shipped package before publishing).
+"""The fixed refund scenario shared by the crash-resume demo and the
+chaos test suite. Kept in one place so both stay in sync.
 """
 
 from datetime import datetime, timezone
@@ -77,7 +73,7 @@ def parallel_refund_script() -> list[LLMResponse | Exception]:
 
     The canonical script above only ever has one tool call per response,
     so it exercises none of the batching path — which is exactly how a
-    real bug lived there undetected until Iteration 33. This scenario
+    real bug once lived there undetected. This scenario
     exists so the chaos suite can kill a process partway through a batch:
     each refund is a distinct side effect with its own idempotency key,
     so resuming must produce three refunds, never two and never four.
