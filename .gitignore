@@ -4,3 +4,8 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .env
+
+# A standalone project used to sanity-check durable-agents as a real
+# consumer would see it — installed from the built wheel into its own
+# venv, never touching src/. Not part of this project.
+/consumer-test/

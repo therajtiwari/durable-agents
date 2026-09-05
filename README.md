@@ -6,8 +6,6 @@ An event-sourced runtime for LLM agents, backed by Postgres. Runs survive
 process restarts, resume where they stopped without repeating side effects, and
 can pause indefinitely when a step needs human approval.
 
-Status: alpha. Python 3.12+, asyncio only.
-
 ## How it works
 
 Every model call, tool call, and approval is appended to a log before and after
@@ -139,7 +137,7 @@ and `strict`.
 runtime = Runtime(store=..., llm=..., guardrail_profile="standard")
 ```
 
-[`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) has the measured attack-success
+[`docs/THREAT_MODEL.md`](https://github.com/therajtiwari/durable-agents/blob/develop/docs/THREAT_MODEL.md) has the measured attack-success
 and false-positive rates for each profile.
 
 ## HTTP API
@@ -213,18 +211,6 @@ Event fields are only ever added, always with a default, and the meaning of an
 existing field does not change. If that ever has to happen, `schema_version` is
 added in the same release and its absence means version 1.
 
-## Alternatives
-
-[Temporal](https://temporal.io) is a mature, general-purpose durable execution
-engine with distributed workers, timers and signals. Use it if you need those,
-or if agent-specific features are not what you're missing. LangGraph's
-checkpointers snapshot graph state, which covers resumption without giving you
-an event log to query.
-
-What this adds over a general engine is agent-shaped: token and cost accounting
-per step, idempotency keys on tool calls, approval as a persisted state, and a
-log you can query in SQL.
-
 ## Development
 
 ```bash
@@ -257,9 +243,9 @@ scripts use `sys.stdout.reconfigure(encoding="utf-8", errors="replace")`.
 
 ## Docs
 
-- [`docs/SPEC.md`](docs/SPEC.md) — architecture and component reference
-- [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) — guardrail threat model and measurements
-- [`DECISIONS.md`](DECISIONS.md) — design decisions and rejected alternatives
+- [`docs/SPEC.md`](https://github.com/therajtiwari/durable-agents/blob/develop/docs/SPEC.md) — architecture and component reference
+- [`docs/THREAT_MODEL.md`](https://github.com/therajtiwari/durable-agents/blob/develop/docs/THREAT_MODEL.md) — guardrail threat model and measurements
+- [`DECISIONS.md`](https://github.com/therajtiwari/durable-agents/blob/develop/DECISIONS.md) — design decisions and rejected alternatives
 
 ## License
 

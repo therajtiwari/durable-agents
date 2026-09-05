@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
 license-files = ["LICENSE"]
+authors = [{ name = "Raj Tiwari" }]
 keywords = ["llm", "agents", "durable-execution", "event-sourcing", "postgres"]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -23,6 +24,11 @@ dependencies = [
     "pydantic>=2",
     "asyncpg",
 ]
+
+[project.urls]
+# Without these the PyPI page carries no link back to the source at all.
+Repository = "https://github.com/therajtiwari/durable-agents"
+Issues = "https://github.com/therajtiwari/durable-agents/issues"
 
 [project.optional-dependencies]
 # The HTTP approve/deny/status endpoints. Optional because the runtime
