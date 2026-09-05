@@ -9,6 +9,8 @@ can pause indefinitely when a step needs human approval.
 
 ## How it works
 
+![Architecture: orchestrator, event store, guardrails, and tool registry](https://raw.githubusercontent.com/therajtiwari/durable-agents/main/assets/architecture.png)
+
 Every model call, tool call, and approval is appended to a log before and after
 it happens. Run state is a fold over that log, so a process that dies mid-run
 leaves enough behind for another one to finish the job:
