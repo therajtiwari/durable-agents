@@ -1,6 +1,7 @@
 # durable-agents
 
 [![CI](https://github.com/therajtiwari/durable-agents/actions/workflows/ci.yml/badge.svg)](https://github.com/therajtiwari/durable-agents/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/durable-agents.svg)](https://pypi.org/project/durable-agents/)
 
 An event-sourced runtime for LLM agents, backed by Postgres. Runs survive
 process restarts, resume where they stopped without repeating side effects, and
